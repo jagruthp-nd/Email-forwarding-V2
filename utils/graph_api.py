@@ -7,9 +7,25 @@ All calls use the Function App's System-assigned Managed Identity
 (DefaultAzureCredential) – no client secrets stored in code.
 
 Required Graph API application permissions (granted via assign_permissions.ps1):
-  - Directory.Read.All       : list terminated/disabled users
-  - User.ReadWrite.All       : delete accounts
-  - MailboxSettings.ReadWrite: read & clear mailbox forwarding
+  - Directory.Read.All                       : list terminated/disabled users
+  - User.ReadWrite.All                       : delete accounts
+  - MailboxSettings.ReadWrite                : read & clear mailbox forwarding
+  - CustomSecAttributeAssignment.ReadWrite.All : read/write Custom Security Attributes
+
+Workflow B note:
+  The extension approval signal is stored as a Custom Security Attribute (CSA):
+    Attribute set : CSA_ATTRIBUTE_SET  (default "EFAutomation")
+    Attribute name: CSA_ATTRIBUTE_NAME (default "ExtensionStatus")
+
+  CSA are cloud-native and writable directly in Azure AD / Entra portal —
+  unlike onPremisesExtensionAttributes which are read-only from the cloud
+  for on-premises synced users.
+
+  Lifecycle of CSA value:
+    (absent)        → no alert sent yet
+    "EF_ALERT_SENT" → alert email was sent; IT should raise ticket → approve → update
+    "EXTEND_30"     → approved; daily monitor will extend +30 days and clear
+    (cleared)       → extension has been processed
 """
 
 from __future__ import annotations
@@ -125,6 +141,7 @@ def get_terminated_users() -> List[Dict[str, Any]]:
         "accountEnabled",
         "employeeType",
         "onPremisesExtensionAttributes",
+        "customSecurityAttributes",       # EFAutomation.ExtensionStatus (Workflow B)
     ])
     filter_expr = (
         "employeeType eq 'Terminated'"
@@ -150,6 +167,102 @@ def get_terminated_users() -> List[Dict[str, Any]]:
 
     logger.info("Graph: found %d terminated+disabled users", len(users))
     return users
+
+
+# ---------------------------------------------------------------------------
+# Workflow B – Custom Security Attribute (CSA) config
+#
+# One-time setup in Azure AD admin center before first use:
+#   1. Create attribute set:  name = CSA_ATTRIBUTE_SET  (default "EFAutomation")
+#   2. Create attribute:      name = CSA_ATTRIBUTE_NAME (default "ExtensionStatus")
+#                             type = String, single-value, not predefined values
+#   3. Grant managed identity the "Attribute Assignment Administrator" role
+#      (or the CustomSecAttributeAssignment.ReadWrite.All app permission –
+#       see infra/assign_permissions.ps1)
+# ---------------------------------------------------------------------------
+
+#: Azure AD Custom Security Attribute set name (configure via env var).
+CSA_ATTRIBUTE_SET  = os.environ.get("CSA_ATTRIBUTE_SET",  "EFAutomation")
+#: Azure AD Custom Security Attribute name within the set (configure via env var).
+CSA_ATTRIBUTE_NAME = os.environ.get("CSA_ATTRIBUTE_NAME", "ExtensionStatus")
+
+#: Values the daily monitor treats as "extension approved – extend 30 days".
+_APPROVED_VALUES: frozenset = frozenset({"EXTEND_30", "APPROVED", "YES"})
+
+
+def get_extension_attribute(user: Dict[str, Any]) -> Optional[str]:
+    """
+    Return the current value of the CSA ExtensionStatus attribute from the
+    already-fetched Azure AD user dict, or None if not set.
+
+    The user dict must have been fetched with $select=customSecurityAttributes
+    (handled by get_terminated_users).
+    """
+    csa = user.get("customSecurityAttributes") or {}
+    attr_set = csa.get(CSA_ATTRIBUTE_SET) or {}
+    value = (attr_set.get(CSA_ATTRIBUTE_NAME) or "").strip()
+    return value or None
+
+
+def is_extension_approved(user: Dict[str, Any]) -> bool:
+    """Return True if the CSA ExtensionStatus signals an approved extension."""
+    value = get_extension_attribute(user)
+    return value is not None and value.upper() in _APPROVED_VALUES
+
+
+def set_extension_attribute(user_id: str, value: str) -> bool:
+    """
+    Set the CSA ExtensionStatus attribute on the Azure AD user.
+
+    Because Custom Security Attributes are cloud-native (not synced from
+    on-prem AD), this PATCH works for both cloud-only and on-prem synced
+    users as long as the managed identity has
+    CustomSecAttributeAssignment.ReadWrite.All.
+    """
+    ok = _patch(
+        f"{_GRAPH_BASE}/users/{user_id}",
+        {
+            "customSecurityAttributes": {
+                CSA_ATTRIBUTE_SET: {
+                    "@odata.type": "#Microsoft.DirectoryServices.CustomSecurityAttributeValue",
+                    CSA_ATTRIBUTE_NAME: value,
+                }
+            }
+        },
+    )
+    if ok:
+        logger.info("Set CSA %s.%s=%s for userId=%s", CSA_ATTRIBUTE_SET, CSA_ATTRIBUTE_NAME, value, user_id)
+    else:
+        logger.error(
+            "Failed to set CSA %s.%s=%s for userId=%s – check CustomSecAttributeAssignment.ReadWrite.All permission",
+            CSA_ATTRIBUTE_SET, CSA_ATTRIBUTE_NAME, value, user_id,
+        )
+    return ok
+
+
+def clear_extension_attribute(user_id: str) -> bool:
+    """
+    Clear the CSA ExtensionStatus attribute after the extension has been processed.
+    """
+    ok = _patch(
+        f"{_GRAPH_BASE}/users/{user_id}",
+        {
+            "customSecurityAttributes": {
+                CSA_ATTRIBUTE_SET: {
+                    "@odata.type": "#Microsoft.DirectoryServices.CustomSecurityAttributeValue",
+                    CSA_ATTRIBUTE_NAME: None,
+                }
+            }
+        },
+    )
+    if ok:
+        logger.info("Cleared CSA %s.%s for userId=%s", CSA_ATTRIBUTE_SET, CSA_ATTRIBUTE_NAME, user_id)
+    else:
+        logger.error(
+            "Failed to clear CSA %s.%s for userId=%s – check CustomSecAttributeAssignment.ReadWrite.All permission",
+            CSA_ATTRIBUTE_SET, CSA_ATTRIBUTE_NAME, user_id,
+        )
+    return ok
 
 
 def extract_offboard_date(user: Dict[str, Any]) -> Optional[str]:

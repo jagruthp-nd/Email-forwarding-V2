@@ -24,9 +24,10 @@ Write-Host "Microsoft Graph Service Principal ID: $($GraphSp.ObjectId)" -Foregro
 
 # Define required permissions
 $requiredRoles = @(
-    "Directory.Read.All",       # Read terminated users from Azure AD
-    "User.ReadWrite.All",       # Delete user accounts
-    "MailboxSettings.ReadWrite" # Read/update mailbox forwarding settings
+    "Directory.Read.All",                       # Read terminated users from Azure AD
+    "User.ReadWrite.All",                       # Delete user accounts
+    "MailboxSettings.ReadWrite",                # Read/update mailbox forwarding settings
+    "CustomSecAttributeAssignment.ReadWrite.All" # Read/write Custom Security Attributes (Workflow B)
 )
 
 foreach ($roleName in $requiredRoles) {
@@ -60,5 +61,10 @@ Write-Host "Graph API permissions assigned successfully." -ForegroundColor Green
 Write-Host "Permissions granted:" -ForegroundColor Cyan
 $requiredRoles | ForEach-Object { Write-Host "  - $_" }
 Write-Host ""
-Write-Host "NOTE: It may take a few minutes for permissions to propagate." -ForegroundColor Yellow
+Write-Host "IMPORTANT – Additional manual step for Custom Security Attributes:" -ForegroundColor Yellow
+Write-Host "  1. Open Azure AD admin center → Custom Security Attributes" -ForegroundColor Yellow
+Write-Host "  2. Create attribute set:  EFAutomation  (or the value of CSA_ATTRIBUTE_SET)" -ForegroundColor Yellow
+Write-Host "  3. Create attribute:      ExtensionStatus  (String, single-value)" -ForegroundColor Yellow
+Write-Host "  4. Assign 'Attribute Assignment Administrator' role to the IT Engineers" -ForegroundColor Yellow
+Write-Host "     who will approve extension requests." -ForegroundColor Yellow
 Write-Host "============================================================" -ForegroundColor Cyan

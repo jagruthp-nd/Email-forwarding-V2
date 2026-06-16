@@ -10,15 +10,21 @@ Decision matrix (days elapsed from offboard date):
   │ Day ≥30 │ DELETE account (reason: NO_EF)           │
   └─────────┴──────────────────────────────────────────┘
 
-  EF Required = YES
-  ┌────────────────────┬──────────────────────────────────────────────────┐
-  │ Day 25–29          │ ALERT if not already alerted (extension 0)       │
-  │ Day ≥30, ext=0     │ DELETE (reason: NO_EXTENSION_DAY30)              │
-  │ Day 55–59, ext=1   │ ALERT if not already alerted (before Day 60)     │
-  │ Day ≥60, ext=1     │ DELETE (reason: NO_EXTENSION_DAY60)              │
-  │ Day 85–89, ext=2   │ ALERT if not already alerted (FINAL, before D90) │
-  │ Day ≥90            │ DELETE (reason: MAX_POLICY_DAY90)                │
-  └────────────────────┴──────────────────────────────────────────────────┘
+  EF Required = YES  (Workflow B – attribute-based approval)
+  ┌────────────────────┬────────────────────────────────────────────────────────────┐
+  │ Any day            │ If extensionAttribute11 = EXTEND_30 → extend +30 days,     │
+  │                    │ clear attribute, send confirm (checked before alert/delete) │
+  │ Day ALERT_DAY_1    │ ALERT if not already alerted (extension 0)                 │
+  │ (default: Day 23)  │ Set extensionAttribute11=EF_ALERT_SENT on user profile     │
+  │                    │ Email instructs manager to raise a ServiceDesk ticket       │
+  │ Day ≥30, ext=0     │ DELETE (reason: NO_EXTENSION_DAY30)                        │
+  │ Day ALERT_DAY_2    │ ALERT if not already alerted (before Day 60)               │
+  │ (default: Day 53)  │ Set extensionAttribute11=EF_ALERT_SENT on user profile     │
+  │ Day ≥60, ext=1     │ DELETE (reason: NO_EXTENSION_DAY60)                        │
+  │ Day ALERT_DAY_3    │ ALERT if not already alerted (FINAL, before D90)           │
+  │ (default: Day 83)  │                                                            │
+  │ Day ≥90            │ DELETE (reason: MAX_POLICY_DAY90)                          │
+  └────────────────────┴────────────────────────────────────────────────────────────┘
 
 Alert windows (25–29, 55–59, 85–89) catch up on missed runs:
   If the daily function was down on Day 25, the alert fires on Day 26, 27 …
@@ -27,11 +33,14 @@ Alert windows (25–29, 55–59, 85–89) catch up on missed runs:
 Idempotency:
   Each user record carries a `lastAlertDate` field.  The monitor will not
   send a second alert for the same period even if re-run within the window.
+  The attribute check is also idempotent: the attribute is cleared immediately
+  after processing so it cannot trigger a second extension on the next run.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple
 
@@ -42,9 +51,13 @@ from .graph_api    import (
     has_email_forwarding,
     delete_user,
     get_manager,
+    is_extension_approved,
+    set_extension_attribute,
+    clear_extension_attribute,
 )
 from .email_sender import (
     send_ef_alert,
+    send_extension_confirm,
     send_deletion_notice,
     send_final_deletion_notice,
 )
@@ -53,13 +66,33 @@ logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Alert / delete thresholds (in days from offboard date)
+#
+# Alert days are configurable via environment variables so the window before
+# the deletion deadline can be tuned without a code deployment.
+# Defaults to Day 23 / 53 / 83 (7 days before each deletion) to give enough
+# time for the ServiceDesk ticket to be raised, HR + Infosec to approve, and
+# IT to set extensionAttribute11.
+#
+# Delete thresholds are fixed policy limits and are NOT configurable.
 # ---------------------------------------------------------------------------
-_ALERT_WINDOW_1  = (25, 29)   # alert before Day-30 delete
+_ALERT_DAY_1     = int(os.environ.get("ALERT_DAY_1", "23"))  # default: Day 23
 _DELETE_1        = 30
-_ALERT_WINDOW_2  = (55, 59)   # alert before Day-60 delete
+_ALERT_WINDOW_1  = (_ALERT_DAY_1, _DELETE_1 - 1)             # e.g., (23, 29)
+
+_ALERT_DAY_2     = int(os.environ.get("ALERT_DAY_2", "53"))  # default: Day 53
 _DELETE_2        = 60
-_ALERT_WINDOW_3  = (85, 89)   # final alert before Day-90 delete
+_ALERT_WINDOW_2  = (_ALERT_DAY_2, _DELETE_2 - 1)             # e.g., (53, 59)
+
+_ALERT_DAY_3     = int(os.environ.get("ALERT_DAY_3", "83"))  # default: Day 83
 _DELETE_3        = 90
+_ALERT_WINDOW_3  = (_ALERT_DAY_3, _DELETE_3 - 1)             # e.g., (83, 89)
+
+# Maximum number of extensions (Workflow B hard cap = Day 90 policy)
+_MAX_EXTENSIONS  = 2
+
+# Value written to extensionAttribute11 when the alert email is sent.
+# IT changes this to "EXTEND_30" / "APPROVED" after HR + Infosec approval.
+_ATTR_ALERT_SENT = "EF_ALERT_SENT"
 
 
 # ---------------------------------------------------------------------------
@@ -178,35 +211,44 @@ def _process_user(
             return _do_delete(user_id, record, "NO_EF", store)
         return "no_action"
 
-    # ── 5. HAS EF – alert / delete decision ────────────────────────────────
+    # ── 5. HAS EF – Workflow B attribute check (runs before alert/delete) ───
+    #   IT Engineer sets extensionAttribute11 = "EXTEND_30" in Azure AD after
+    #   HR + Infosec approve the manager's ServiceDesk ticket.  The monitor
+    #   detects it here, applies the extension, and clears the attribute so it
+    #   cannot trigger a second extension on the next daily run.
+    record = _check_and_apply_extension_attribute(user, record, store)
+    # Refresh locals in case an extension was just applied.
+    ext_count  = int(record.get("extensionCount", 0))
 
-    # ---- 5a. WINDOW 1: Day 25–29, extension 0 → first alert ---------------
+    # ── 6. HAS EF – alert / delete decision ────────────────────────────────
+
+    # ---- 6a. WINDOW 1: Day _ALERT_DAY_1 to Day 29, extension 0 → first alert ---
     if _ALERT_WINDOW_1[0] <= days_elapsed <= _ALERT_WINDOW_1[1]:
-        if ext_count == 0 and not _already_alerted(last_alert, offboard_date, 25):
+        if ext_count == 0 and not _already_alerted(last_alert, offboard_date, _ALERT_DAY_1, _DELETE_1 - 1):
             return _do_alert(record, store, days_remaining=_DELETE_1 - days_elapsed, is_final=False)
         return "no_action"
 
-    # ---- 5b. Day ≥ 30, no extension → delete ------------------------------
+    # ---- 6b. Day ≥ 30, no extension → delete ------------------------------
     if days_elapsed >= _DELETE_1 and ext_count == 0:
         return _do_delete(user_id, record, "NO_EXTENSION_DAY30", store)
 
-    # ---- 5c. WINDOW 2: Day 55–59, extension 1 → second alert --------------
+    # ---- 6c. WINDOW 2: Day _ALERT_DAY_2 to Day 59, extension 1 → second alert -
     if _ALERT_WINDOW_2[0] <= days_elapsed <= _ALERT_WINDOW_2[1]:
-        if ext_count == 1 and not _already_alerted(last_alert, offboard_date, 55):
+        if ext_count == 1 and not _already_alerted(last_alert, offboard_date, _ALERT_DAY_2, _DELETE_2 - 1):
             return _do_alert(record, store, days_remaining=_DELETE_2 - days_elapsed, is_final=False)
         return "no_action"
 
-    # ---- 5d. Day ≥ 60, only 1 extension used → delete ---------------------
+    # ---- 6d. Day ≥ 60, only 1 extension used → delete ---------------------
     if days_elapsed >= _DELETE_2 and ext_count == 1:
         return _do_delete(user_id, record, "NO_EXTENSION_DAY60", store)
 
-    # ---- 5e. WINDOW 3: Day 85–89, extension 2 → final alert ---------------
+    # ---- 6e. WINDOW 3: Day _ALERT_DAY_3 to Day 89, extension 2 → final alert -
     if _ALERT_WINDOW_3[0] <= days_elapsed <= _ALERT_WINDOW_3[1]:
-        if ext_count == 2 and not _already_alerted(last_alert, offboard_date, 85):
+        if ext_count == 2 and not _already_alerted(last_alert, offboard_date, _ALERT_DAY_3, _DELETE_3 - 1):
             return _do_alert(record, store, days_remaining=_DELETE_3 - days_elapsed, is_final=True)
         return "no_action"
 
-    # ---- 5f. Day ≥ 90 → final delete -------------------------------------
+    # ---- 6f. Day ≥ 90 → final delete -------------------------------------
     if days_elapsed >= _DELETE_3:
         return _do_delete(user_id, record, "MAX_POLICY_DAY90", store, is_final=True)
 
@@ -228,6 +270,10 @@ def _do_alert(
 
     ok = send_ef_alert(record, days_remaining=max(days_remaining, 1), is_final=is_final)
 
+    # Mark the Azure AD user profile so IT can see the alert has been sent.
+    # IT changes this value to "EXTEND_30" after HR + Infosec approval.
+    set_extension_attribute(user_id, _ATTR_ALERT_SENT)
+
     status = "ALERT_SENT"
     store.append_email_log(
         user_id=user_id,
@@ -242,7 +288,7 @@ def _do_alert(
     store.upsert_user(record)
 
     action_label = "FINAL_ALERT" if is_final else "ALERTED"
-    store.append_audit(user_id, action_label, f"Alert sent. days_remaining={days_remaining}")
+    store.append_audit(user_id, action_label, f"Alert sent. days_remaining={days_remaining}. extensionAttribute11 set to {_ATTR_ALERT_SENT}")
     logger.info("Alert sent for userId=%s (days_remaining=%d final=%s)", user_id, days_remaining, is_final)
     return "alerted"
 
@@ -287,6 +333,97 @@ def _do_delete(
     store.append_audit(user_id, "DELETED", f"reason={reason}")
     logger.info("Deleted userId=%s reason=%s", user_id, reason)
     return "deleted"
+
+
+# ---------------------------------------------------------------------------
+# Workflow B – extension attribute check
+# ---------------------------------------------------------------------------
+
+def _check_and_apply_extension_attribute(
+    user: Dict[str, Any],
+    record: Dict[str, Any],
+    store: TableStore,
+) -> Dict[str, Any]:
+    """
+    Inspect extensionAttribute11 on the live Azure AD user object.
+
+    If IT has set it to an approved value (EXTEND_30 / APPROVED / YES):
+      - Increment extensionCount
+      - Recalculate deleteDate = offboardDate + extensionCount × 30 days
+      - Clear the attribute in Azure AD so it cannot trigger again tomorrow
+      - Send a confirmation email to the manager
+      - Write audit log
+
+    If the attribute is set but extensionCount is already at the maximum,
+    the attribute is still cleared (to avoid confusion) but no extension is granted.
+
+    Returns the (possibly updated) record dict.
+    """
+    if not is_extension_approved(user):
+        return record
+
+    user_id   = record["userId"]
+    ext_count = int(record.get("extensionCount", 0))
+
+    if ext_count >= _MAX_EXTENSIONS:
+        logger.warning(
+            "userId=%s extensionAttribute11 is set but max extensions (%d) already reached – "
+            "clearing attribute without applying extension",
+            user_id, _MAX_EXTENSIONS,
+        )
+        clear_extension_attribute(user_id)
+        store.append_audit(
+            user_id,
+            "ATTR_IGNORED",
+            f"extensionAttribute11 set but max extensions ({_MAX_EXTENSIONS}) already reached",
+        )
+        return record
+
+    # Apply the extension
+    new_ext_count = ext_count + 1
+    try:
+        offboard_date = date.fromisoformat(record["offboardDate"])
+    except (ValueError, KeyError) as exc:
+        logger.error(
+            "userId=%s cannot apply attribute extension – invalid offboardDate in record: %s",
+            user_id, exc,
+        )
+        return record
+
+    new_delete_date = offboard_date + timedelta(days=new_ext_count * 30)
+
+    record["extensionCount"] = new_ext_count
+    record["deleteDate"]     = new_delete_date.isoformat()
+    record["statusCode"]     = "EXTENDED" if new_ext_count < _MAX_EXTENSIONS else "EXTENDED_MAX"
+    record["lastAlertDate"]  = ""  # reset so the next alert window fires normally
+
+    store.upsert_user(record)
+    store.append_audit(
+        user_id,
+        "EXTENDED",
+        f"Extension {new_ext_count}/{_MAX_EXTENSIONS} applied via extensionAttribute11 "
+        f"(Workflow B – IT action after HR+Infosec approval). "
+        f"New deleteDate={new_delete_date.isoformat()}",
+    )
+
+    # Clear the attribute immediately so it does not re-trigger tomorrow.
+    clear_extension_attribute(user_id)
+
+    # Send confirmation email to manager + IT CC
+    ok = send_extension_confirm(record)
+    store.append_email_log(
+        user_id=user_id,
+        email_type="EXTENSION_CONFIRM",
+        recipient=record.get("managerEmail", ""),
+        subject=f"EF Extended – {record.get('displayName', '')}",
+        status="SENT" if ok else "FAILED",
+    )
+
+    logger.info(
+        "Attribute-based extension %d/%d applied for userId=%s – new deleteDate=%s",
+        new_ext_count, _MAX_EXTENSIONS, user_id, new_delete_date.isoformat(),
+    )
+    return record
 
 
 # ---------------------------------------------------------------------------
@@ -363,19 +500,21 @@ def _bool(value: Any) -> bool:
     return bool(value)
 
 
-def _already_alerted(last_alert_date: str, offboard_date: date, expected_day: int) -> bool:
+def _already_alerted(last_alert_date: str, offboard_date: date, window_start_day: int, window_end_day: int) -> bool:
     """
     Return True if an alert was already sent during the current alert window.
 
-    We consider an alert 'already sent' if lastAlertDate falls within
-    5 days before the expected deletion day (i.e., the same window).
+    window_start_day / window_end_day are both expressed as days-from-offboard.
+    The window covers the full range from the configured alert day to the day
+    before the deletion deadline, so a catch-up run within the same window
+    does not re-send the alert.
     """
     if not last_alert_date:
         return False
     try:
         alerted = date.fromisoformat(last_alert_date)
-        window_start = offboard_date + timedelta(days=expected_day)
-        window_end   = offboard_date + timedelta(days=expected_day + 4)
+        window_start = offboard_date + timedelta(days=window_start_day)
+        window_end   = offboard_date + timedelta(days=window_end_day)
         return window_start <= alerted <= window_end
     except ValueError:
         return False

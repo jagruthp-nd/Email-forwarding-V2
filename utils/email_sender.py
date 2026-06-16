@@ -7,9 +7,12 @@ The SMTP password is fetched from Azure Key Vault on first use and cached
 for the lifetime of the function instance.  This avoids redundant KV calls
 on every email while still keeping the secret out of code and config files.
 
-Four email types:
-  ALERT              – Day 25 / 55 / 85 warning sent to manager + IT CC
-  EXTENSION_CONFIRM  – Confirmation sent after manager approves extension
+Four email types (Workflow B):
+  ALERT              – Day 25 / 55 / 85 warning sent to manager + IT CC.
+                       Instructs manager to raise a ServiceDesk ticket with
+                       business justification; no email-reply extension.
+  EXTENSION_CONFIRM  – Confirmation sent after IT applies extensionAttribute11
+                       (i.e., after HR + Infosec approval).
   DELETION_NOTICE    – Account has been deleted (Day 30 / 60 no-extension path)
   FINAL_DELETION     – Day 90 max-policy deletion with recovery instructions
 """
@@ -123,13 +126,13 @@ def _send(
 
 def send_ef_alert(record: Dict[str, Any], days_remaining: int, is_final: bool = False) -> bool:
     """
-    Day 25 / 55 / 85 alert to manager with CC to IT.
+    Day ALERT_DAY_1 / ALERT_DAY_2 / ALERT_DAY_3 alert to manager with CC to IT.
 
     Parameters
     ----------
     record         : UserTracking dict
-    days_remaining : How many days until the account is deleted (always 5 in current policy)
-    is_final       : True when this is the Day-85 final warning (max policy)
+    days_remaining : How many days until the account is deleted
+    is_final       : True when this is the Day-ALERT_DAY_3 final warning (max policy)
     """
     manager_email = record.get("managerEmail", "")
     if not manager_email:
@@ -137,6 +140,7 @@ def send_ef_alert(record: Dict[str, Any], days_remaining: int, is_final: bool = 
         return False
 
     it_email      = os.environ.get("IT_EMAIL", "it-operations@netradyne.com")
+    sdp_ticket_url = os.environ.get("SDP_TICKET_URL", "")
     employee_name = record.get("displayName", "the terminated employee")
     employee_mail = record.get("userEmail", "")
     offboard_date = record.get("offboardDate", "")
@@ -160,6 +164,20 @@ def send_ef_alert(record: Dict[str, Any], days_remaining: int, is_final: bool = 
             f'&#9888; Action Required – Email forwarding expires in <u>{days_remaining} days</u>.</div>'
         )
         subject = f"Email Forwarding Expiration – {employee_name} – Action Required"
+
+    # Build the SDP button only when the URL is configured
+    if sdp_ticket_url:
+        sdp_button = (
+            f'<a href="{sdp_ticket_url}" target="_blank" '
+            'style="display:inline-block;margin-top:12px;padding:10px 20px;'
+            'background:#0078d4;color:#fff;text-decoration:none;'
+            'border-radius:4px;font-weight:bold;">&#128196; Raise Extension Request in ServiceDesk</a>'
+        )
+    else:
+        sdp_button = (
+            f'<p style="margin:8px 0 0;">Contact <a href="mailto:{it_email}">{it_email}</a> '
+            'to get the ServiceDesk ticket template link.</p>'
+        )
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -202,12 +220,24 @@ def send_ef_alert(record: Dict[str, Any], days_remaining: int, is_final: bool = 
 
     {'<p><strong>No further extensions are available. The account will be permanently deleted on the date shown above.</strong></p>' if is_final else f'''
     <div style="background:#d1ecf1;border:1px solid #bee5eb;padding:16px;border-radius:4px;margin:20px 0;">
-      <h3 style="margin:0 0 8px;color:#0c5460;">&#x2192; To extend email forwarding by 30 more days:</h3>
-      <p style="margin:0;">Simply reply to this email with the word <strong>EXTEND</strong>.<br>
-      Your reply will be processed automatically and you will receive a confirmation.</p>
+      <h3 style="margin:0 0 10px;color:#0c5460;">&#x2192; To request a 30-day extension:</h3>
+      <ol style="margin:0;padding-left:20px;line-height:1.7;">
+        <li>Raise a <strong>ServiceDesk ticket</strong> with your business justification and the
+            duration requested (maximum 30 days per extension).</li>
+        <li>HR and Infosec will review and approve the request
+            <em>(SLA: 2 business days each)</em>.</li>
+        <li>Upon approval, IT will process the extension in Azure AD.
+            You will receive a <strong>confirmation email</strong> once the new expiry is active.</li>
+      </ol>
+      {sdp_button}
+      <p style="margin:12px 0 0;font-weight:bold;color:#721c24;">
+        &#9888; Your request must be raised and fully approved before
+        <u>{delete_date}</u> to prevent account deletion.
+      </p>
     </div>
     <p style="font-size:13px;color:#666;">
-      Company policy: Maximum 90 days of email forwarding from offboarding date (3 × 30-day periods).
+      Company policy: Maximum 90 days of email forwarding from offboarding date (2 x 30-day extensions).
+      Extensions require HR and Infosec approval per compliance requirements (SDP).
     </p>
     '''}
 
@@ -251,7 +281,8 @@ def send_extension_confirm(record: Dict[str, Any]) -> bool:
 
   <div style="background:#f8f9fa;padding:24px;border:1px solid #dee2e6;border-top:none;border-radius:0 0 6px 6px;">
     <p>Dear Manager,</p>
-    <p>Your extension request for <strong>{employee_name}</strong> has been approved and processed.</p>
+    <p>Your ServiceDesk extension request for <strong>{employee_name}</strong> has been
+    approved by HR and Infosec, and the extension has been applied by IT.</p>
 
     <table style="width:100%;border-collapse:collapse;margin:16px 0;">
       <tr style="background:#e9ecef;">
@@ -291,15 +322,21 @@ def send_deletion_notice(record: Dict[str, Any], reason: str) -> bool:
     if not manager_email:
         return False
 
-    it_email      = os.environ.get("IT_EMAIL", "it-operations@netradyne.com")
+    it_email      = os.environ.get("IT_EMAIL", "it@netradyne.com")
     employee_name = record.get("displayName", "the terminated employee")
     employee_mail = record.get("userEmail", "")
     deleted_date  = datetime.now(timezone.utc).strftime("%B %d, %Y")
 
     reason_text_map = {
-        "NO_EF":                "No email forwarding was configured for this account.",
-        "NO_EXTENSION_DAY30":   "No extension was requested before the 30-day deadline.",
-        "NO_EXTENSION_DAY60":   "No second extension was requested before the 60-day deadline.",
+        "NO_EF":              "No email forwarding was configured for this account.",
+        "NO_EXTENSION_DAY30": (
+            "No approved extension request was processed before the 30-day deadline. "
+            "A ServiceDesk ticket with HR and Infosec approval was required."
+        ),
+        "NO_EXTENSION_DAY60": (
+            "No approved second extension was processed before the 60-day deadline. "
+            "A ServiceDesk ticket with HR and Infosec approval was required."
+        ),
     }
     reason_text = reason_text_map.get(reason, "As per company offboarding policy.")
 

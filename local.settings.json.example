@@ -17,6 +17,13 @@
     "IT_EMAIL":              "it-operations@netradyne.com",
     "RECOVERY_GRACE_DAYS":   "30",
 
-    "WEBHOOK_TOKEN":         "<optional-shared-secret-for-webhook-security>"
+    "ALERT_DAY_1":           "23",
+    "ALERT_DAY_2":           "53",
+    "ALERT_DAY_3":           "83",
+
+    "SDP_TICKET_URL":        "<servicedesk-extension-request-template-url>",
+
+    "CSA_ATTRIBUTE_SET":     "EFAutomation",
+    "CSA_ATTRIBUTE_NAME":    "ExtensionStatus"
   }
 }
