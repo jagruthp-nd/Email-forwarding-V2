@@ -5,6 +5,8 @@
     "FUNCTIONS_WORKER_RUNTIME": "python",
 
     "AZURE_TENANT_ID":       "<your-tenant-id>",
+    "AZURE_CLIENT_ID":       "<app-registration-client-id>",
+    "AZURE_CLIENT_SECRET":   "<app-registration-client-secret>",
     "STORAGE_ACCOUNT_NAME":  "<stefautomation>",
 
     "KEY_VAULT_NAME":        "<kv-ef-automation>",
@@ -21,9 +23,28 @@
     "ALERT_DAY_2":           "53",
     "ALERT_DAY_3":           "83",
 
+    "DELETE_DAY_1":          "46",
+    "DELETE_DAY_2":          "76",
+
+    "AUTO_DELETE_NO_EF":     "false",
+    "DELETE_REGION":         "IN",
+
     "SDP_TICKET_URL":        "<servicedesk-extension-request-template-url>",
 
     "CSA_ATTRIBUTE_SET":     "EFAutomation",
-    "CSA_ATTRIBUTE_NAME":    "ExtensionStatus"
+    "CSA_ATTRIBUTE_NAME":    "ExtStatus",
+    "CSA_TICKET_REF_NAME":   "TicketRef",
+
+    "IT_APPROVAL_EMAIL":        "<it-ops-approval-mailbox@netradyne.com>",
+    "OOO_MAX_DAYS":             "30",
+    "APPROVAL_TOKEN_DAYS":      "7",
+    "FUNC_BASE_URL":            "<https://your-function-app.azurewebsites.net>",
+
+    "ADMIN_EMAILS":              "<comma-separated admin emails, e.g. admin1@domain.com,admin2@domain.com>",
+    "WEEKLY_REPORT_SCHEDULE":    "0 30 8 * * 5",
+
+    "CLEANUP_SCHEDULE":          "0 0 6 1 * *",
+    "CLEANUP_REGION":            "IN",
+    "CLEANUP_MIN_OFFBOARD_DAYS": "30"
   }
 }

@@ -15,7 +15,7 @@ Required Graph API application permissions (granted via assign_permissions.ps1):
 Workflow B note:
   The extension approval signal is stored as a Custom Security Attribute (CSA):
     Attribute set : CSA_ATTRIBUTE_SET  (default "EFAutomation")
-    Attribute name: CSA_ATTRIBUTE_NAME (default "ExtensionStatus")
+    Attribute name: CSA_ATTRIBUTE_NAME (default "ExtStatus")
 
   CSA are cloud-native and writable directly in Azure AD / Entra portal —
   unlike onPremisesExtensionAttributes which are read-only from the cloud
@@ -23,8 +23,10 @@ Workflow B note:
 
   Lifecycle of CSA value:
     (absent)        → no alert sent yet
-    "EF_ALERT_SENT" → alert email was sent; IT should raise ticket → approve → update
-    "EXTEND_30"     → approved; daily monitor will extend +30 days and clear
+    "EF_ALERT_SENT"  → alert email was sent; IT should raise ticket → get approval → update
+    "EXTEND_TO_30"   → IT sets after first approval  (extension 1, deadline Day 30→60)
+    "EXTEND_TO_60"   → IT sets after second approval (extension 2, deadline Day 60→90)
+    "EXTENDED_MAX"   → IT sets when granting final/max extension (deadline Day 90)
     (cleared)       → extension has been processed
 """
 
@@ -41,6 +43,7 @@ from azure.core.credentials import TokenCredential
 logger = logging.getLogger(__name__)
 
 _GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+_GRAPH_BETA = "https://graph.microsoft.com/beta"
 _GRAPH_SCOPE = "https://graph.microsoft.com/.default"
 
 # ---------------------------------------------------------------------------
@@ -140,8 +143,10 @@ def get_terminated_users() -> List[Dict[str, Any]]:
         "displayName",
         "accountEnabled",
         "employeeType",
+        "usageLocation",                  # 2-letter ISO country code used for region-gated deletion
+        "country",                        # full country name (fallback display)
         "onPremisesExtensionAttributes",
-        "customSecurityAttributes",       # EFAutomation.ExtensionStatus (Workflow B)
+        "customSecurityAttributes",       # EFAutomation.ExtStatus (Workflow B)
     ])
     filter_expr = (
         "employeeType eq 'Terminated'"
@@ -184,10 +189,16 @@ def get_terminated_users() -> List[Dict[str, Any]]:
 #: Azure AD Custom Security Attribute set name (configure via env var).
 CSA_ATTRIBUTE_SET  = os.environ.get("CSA_ATTRIBUTE_SET",  "EFAutomation")
 #: Azure AD Custom Security Attribute name within the set (configure via env var).
-CSA_ATTRIBUTE_NAME = os.environ.get("CSA_ATTRIBUTE_NAME", "ExtensionStatus")
+CSA_ATTRIBUTE_NAME = os.environ.get("CSA_ATTRIBUTE_NAME", "ExtStatus")
+#: Azure AD Custom Security Attribute name for the SD+ ticket reference.
+CSA_TICKET_REF_NAME = os.environ.get("CSA_TICKET_REF_NAME", "TicketRef")
 
-#: Values the daily monitor treats as "extension approved – extend 30 days".
-_APPROVED_VALUES: frozenset = frozenset({"EXTEND_30", "APPROVED", "YES"})
+#: Predefined CSA values IT Engineers select to signal an approved extension.
+#: These must exactly match the predefined values configured on the CSA attribute
+#: in Azure AD (attribute set: EFAutomation, attribute: ExtStatus,
+#: "Allow only predefined values" = Yes).  EF_ALERT_SENT is also in the predefined
+#: list so the automation can write it via the Graph API.
+_APPROVED_VALUES: frozenset = frozenset({"EXTEND_TO_30", "EXTEND_TO_60", "EXTENDED_MAX"})
 
 
 def get_extension_attribute(user: Dict[str, Any]) -> Optional[str]:
@@ -323,19 +334,61 @@ def has_email_forwarding(user_id: str) -> bool:
     return False
 
 
+def get_forwarding_address(user_id: str) -> Optional[str]:
+    """
+    Return the mailbox-level SMTP forwarding address for *user_id*, or None.
+
+    Only inspects mailboxSettings (not inbox rules).  Used when creating the
+    initial UserTracking record so the address can be restored if a late
+    extension is approved after EF was disabled at the Day-30 grace point.
+    """
+    settings = _get(f"{_GRAPH_BASE}/users/{user_id}/mailboxSettings")
+    if settings:
+        addr = settings.get("forwardingSmtpAddress") or settings.get("forwardingAddress")
+        if addr:
+            return addr
+    return None
+
+
 def disable_email_forwarding(user_id: str) -> bool:
     """
     Clear mailbox-level email forwarding for a user.
-    Called during account recovery (EF is permanently disabled on recovery).
+
+    Called in two scenarios:
+      1. Grace-period EF removal (Day 30 / Day 60 with no approved extension) –
+         forwarding stops but the account stays alive until DELETE_DAY_1/2.
+      2. Account recovery – EF is permanently disabled on recovery.
     """
     ok = _patch(
         f"{_GRAPH_BASE}/users/{user_id}/mailboxSettings",
         {"forwardingSmtpAddress": None},
     )
     if ok:
-        logger.info("Cleared mailbox forwarding for user %s", user_id)
+        logger.info("Cleared mailbox forwarding for userId=%s", user_id)
     else:
-        logger.warning("Could not clear mailbox forwarding for user %s", user_id)
+        logger.warning("Could not clear mailbox forwarding for userId=%s", user_id)
+    return ok
+
+
+def enable_email_forwarding(user_id: str, forwarding_address: str) -> bool:
+    """
+    (Re-)enable mailbox-level SMTP forwarding for a user.
+
+    Used when a late extension is approved after the Day-30 / Day-60 EF grace
+    removal.  The original forwarding address is stored in the UserTracking
+    record as 'forwardingAddress'.
+    """
+    if not forwarding_address:
+        logger.warning("enable_email_forwarding called for userId=%s with empty address", user_id)
+        return False
+    ok = _patch(
+        f"{_GRAPH_BASE}/users/{user_id}/mailboxSettings",
+        {"forwardingSmtpAddress": forwarding_address},
+    )
+    if ok:
+        logger.info("Re-enabled mailbox forwarding → %s for userId=%s", forwarding_address, user_id)
+    else:
+        logger.warning("Could not re-enable mailbox forwarding for userId=%s", user_id)
     return ok
 
 
@@ -388,3 +441,125 @@ def get_deleted_user(user_id: str) -> Optional[Dict[str, Any]]:
     Useful to confirm a user is recoverable before attempting restore.
     """
     return _get(f"{_GRAPH_BASE}/directory/deletedItems/{user_id}")
+
+
+# ---------------------------------------------------------------------------
+# Auto-Reply (OOO) management
+# ---------------------------------------------------------------------------
+
+def set_auto_reply(user_id: str, manager_name: str, manager_email: str) -> bool:
+    """Configure OOO for a terminated user. Policy-compliant message with manager as alternate contact."""
+    internal_msg = (
+        f"Thank you for your email. This mailbox is no longer monitored as the individual "
+        f"is no longer associated with Netradyne. For business-related matters, please contact "
+        f"{manager_name} at {manager_email}."
+    )
+    external_msg = internal_msg  # same message externally
+    return _patch(
+        f"{_GRAPH_BASE}/users/{user_id}/mailboxSettings",
+        {
+            "automaticRepliesSetting": {
+                "status": "alwaysEnabled",
+                "externalAudience": "all",
+                "internalReplyMessage": internal_msg,
+                "externalReplyMessage": external_msg,
+            }
+        },
+    )
+
+
+def disable_auto_reply(user_id: str) -> bool:
+    """Disable OOO for a user (called after OOO_MAX_DAYS or on deletion)."""
+    return _patch(
+        f"{_GRAPH_BASE}/users/{user_id}/mailboxSettings",
+        {"automaticRepliesSetting": {"status": "disabled"}},
+    )
+
+
+def is_auto_reply_enabled(user_id: str) -> bool:
+    """Return True if OOO is currently active (alwaysEnabled or scheduled)."""
+    settings = _get(f"{_GRAPH_BASE}/users/{user_id}/mailboxSettings")
+    if settings:
+        status = (settings.get("automaticRepliesSetting") or {}).get("status", "disabled")
+        return status in ("alwaysEnabled", "scheduled")
+    return False
+
+
+# ---------------------------------------------------------------------------
+# TicketRef CSA attribute
+# ---------------------------------------------------------------------------
+
+def get_ticket_ref_attribute(user: Dict[str, Any]) -> Optional[str]:
+    """Return the TicketRef CSA value from an already-fetched user dict, or None."""
+    csa = user.get("customSecurityAttributes") or {}
+    attr_set = csa.get(CSA_ATTRIBUTE_SET) or {}
+    value = (attr_set.get(CSA_TICKET_REF_NAME) or "").strip()
+    return value or None
+
+
+def set_ticket_ref_attribute(user_id: str, ticket_ref: str) -> bool:
+    """Set the TicketRef CSA on the Azure AD user."""
+    ok = _patch(
+        f"{_GRAPH_BASE}/users/{user_id}",
+        {
+            "customSecurityAttributes": {
+                CSA_ATTRIBUTE_SET: {
+                    "@odata.type": "#Microsoft.DirectoryServices.CustomSecurityAttributeValue",
+                    CSA_TICKET_REF_NAME: ticket_ref,
+                }
+            }
+        },
+    )
+    if ok:
+        logger.info("Set CSA %s.%s=%s for userId=%s", CSA_ATTRIBUTE_SET, CSA_TICKET_REF_NAME, ticket_ref, user_id)
+    else:
+        logger.error("Failed to set CSA %s.%s for userId=%s", CSA_ATTRIBUTE_SET, CSA_TICKET_REF_NAME, user_id)
+    return ok
+
+
+# ---------------------------------------------------------------------------
+# Litigation hold check
+# ---------------------------------------------------------------------------
+
+def is_litigation_hold_active(user_id: str) -> bool:
+    """
+    Check if a user has an active litigation / in-place hold via the beta endpoint.
+    Returns True if any InPlaceHolds are set on the user mailbox.
+    Requires User.Read.All (or AuditLog.Read.All) on the app registration.
+    """
+    data = _get(f"{_GRAPH_BETA}/users/{user_id}?$select=inPlaceHolds")
+    if data:
+        holds = data.get("inPlaceHolds") or []
+        if holds:
+            logger.info("userId=%s has %d in-place hold(s) – deletion blocked", user_id, len(holds))
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# License removal
+# ---------------------------------------------------------------------------
+
+def get_assigned_license_skus(user_id: str) -> List[str]:
+    """Return list of skuId strings for all assigned licenses."""
+    data = _get(f"{_GRAPH_BASE}/users/{user_id}?$select=assignedLicenses")
+    if data:
+        return [lic.get("skuId", "") for lic in data.get("assignedLicenses", []) if lic.get("skuId")]
+    return []
+
+
+def remove_all_licenses(user_id: str) -> bool:
+    """Remove all M365 licenses from the user. Call after account deletion."""
+    skus = get_assigned_license_skus(user_id)
+    if not skus:
+        logger.info("userId=%s has no licenses to remove", user_id)
+        return True
+    result = _post(
+        f"{_GRAPH_BASE}/users/{user_id}/assignLicense",
+        {"addLicenses": [], "removeLicenses": skus},
+    )
+    if result is not None:
+        logger.info("Removed %d license(s) from userId=%s: %s", len(skus), user_id, skus)
+        return True
+    logger.error("Failed to remove licenses from userId=%s", user_id)
+    return False

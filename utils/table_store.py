@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from azure.core.exceptions import ResourceNotFoundError
 from azure.data.tables import TableServiceClient, UpdateMode
@@ -34,9 +34,11 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Table names
 # ---------------------------------------------------------------------------
-_TRACKING_TABLE = "UserTracking"
-_AUDIT_TABLE    = "AuditLog"
-_EMAIL_TABLE    = "EmailLog"
+_TRACKING_TABLE   = "UserTracking"
+_AUDIT_TABLE      = "AuditLog"
+_EMAIL_TABLE      = "EmailLog"
+_COMPLIANCE_TABLE = "ComplianceExport"
+_TOKENS_TABLE     = "ApprovalTokens"
 
 # Shared PartitionKey for all UserTracking rows
 _TRACKING_PK = "EF"
@@ -52,9 +54,11 @@ class TableStore:
         self._service: TableServiceClient = TableServiceClient(
             endpoint=endpoint, credential=credential
         )
-        self._tracking = self._service.get_table_client(_TRACKING_TABLE)
-        self._audit    = self._service.get_table_client(_AUDIT_TABLE)
-        self._email    = self._service.get_table_client(_EMAIL_TABLE)
+        self._tracking   = self._service.get_table_client(_TRACKING_TABLE)
+        self._audit      = self._service.get_table_client(_AUDIT_TABLE)
+        self._email      = self._service.get_table_client(_EMAIL_TABLE)
+        self._compliance = self._service.get_table_client(_COMPLIANCE_TABLE)
+        self._tokens     = self._service.get_table_client(_TOKENS_TABLE)
 
     # ------------------------------------------------------------------
     # Table initialisation (idempotent – safe to call on every cold start)
@@ -62,7 +66,7 @@ class TableStore:
 
     def ensure_tables(self) -> None:
         """Create tables if they do not exist.  Called once on function startup."""
-        for name in [_TRACKING_TABLE, _AUDIT_TABLE, _EMAIL_TABLE]:
+        for name in [_TRACKING_TABLE, _AUDIT_TABLE, _EMAIL_TABLE, _COMPLIANCE_TABLE, _TOKENS_TABLE]:
             try:
                 self._service.create_table_if_not_exists(name)
                 logger.debug("Table ready: %s", name)
@@ -115,6 +119,19 @@ class TableStore:
             logger.error("Error listing active users: %s", exc)
             return []
 
+    def list_all_users(self) -> List[Dict[str, Any]]:
+        """Return ALL UserTracking rows including DELETED ones (for reporting)."""
+        try:
+            return [
+                dict(e)
+                for e in self._tracking.query_entities(
+                    query_filter="PartitionKey eq 'EF'"
+                )
+            ]
+        except Exception as exc:
+            logger.error("Error listing all users: %s", exc)
+            return []
+
     # ------------------------------------------------------------------
     # AuditLog operations
     # ------------------------------------------------------------------
@@ -153,6 +170,23 @@ class TableStore:
             logger.error("Error fetching audit for %s: %s", user_id, exc)
             return []
 
+    def list_recent_audits(self, since_iso: str) -> List[Dict[str, Any]]:
+        """Return all AuditLog rows where executedAt >= since_iso (cross-partition scan).
+
+        since_iso should be an ISO 8601 UTC string, e.g. '2026-06-23T00:00:00+00:00'.
+        Used by the weekly report to pull activity from the past 7 days.
+        """
+        try:
+            return [
+                dict(e)
+                for e in self._audit.query_entities(
+                    query_filter=f"executedAt ge '{since_iso}'"
+                )
+            ]
+        except Exception as exc:
+            logger.error("Error listing recent audits since %s: %s", since_iso, exc)
+            return []
+
     # ------------------------------------------------------------------
     # EmailLog operations
     # ------------------------------------------------------------------
@@ -182,6 +216,66 @@ class TableStore:
             self._email.create_entity(entity)
         except Exception as exc:
             logger.error("Failed to write email log [%s / %s]: %s", user_id, email_type, exc)
+
+    # ------------------------------------------------------------------
+    # ComplianceExport operations
+    # ------------------------------------------------------------------
+
+    def upsert_compliance_record(self, record: Dict[str, Any]) -> None:
+        """Insert or replace a ComplianceExport row (one row per user, full lifecycle snapshot)."""
+        entity = dict(record)
+        entity["PartitionKey"] = "COMPLIANCE"
+        entity["RowKey"]       = record["userId"]
+        entity["auditGeneratedAt"] = datetime.now(timezone.utc).isoformat()
+        try:
+            self._compliance.upsert_entity(entity=entity, mode=UpdateMode.REPLACE)
+        except Exception as exc:
+            logger.error("Failed to upsert ComplianceExport for userId=%s: %s", record.get("userId"), exc)
+
+    def get_compliance_record(self, user_id: str) -> Optional[Dict[str, Any]]:
+        """Return the ComplianceExport row for user_id, or None."""
+        try:
+            return dict(self._compliance.get_entity(partition_key="COMPLIANCE", row_key=user_id))
+        except ResourceNotFoundError:
+            return None
+        except Exception as exc:
+            logger.error("Error fetching compliance record for %s: %s", user_id, exc)
+            return None
+
+    # ------------------------------------------------------------------
+    # ApprovalTokens operations
+    # ------------------------------------------------------------------
+
+    def store_approval_token(self, token_record: Dict[str, Any]) -> None:
+        """Store an approval token for the IT email Approve/Decline flow."""
+        entity = dict(token_record)
+        entity["PartitionKey"] = "TOKEN"
+        entity["RowKey"]       = token_record["token"]
+        try:
+            self._tokens.create_entity(entity)
+        except Exception as exc:
+            logger.error("Failed to store approval token: %s", exc)
+
+    def get_approval_token(self, token: str) -> Optional[Dict[str, Any]]:
+        """Return a token record by token string, or None."""
+        try:
+            return dict(self._tokens.get_entity(partition_key="TOKEN", row_key=token))
+        except ResourceNotFoundError:
+            return None
+        except Exception as exc:
+            logger.error("Error fetching approval token: %s", exc)
+            return None
+
+    def mark_token_used(self, token: str) -> None:
+        """Mark an approval token as consumed so it cannot be reused."""
+        record = self.get_approval_token(token)
+        if record:
+            record["used"] = True
+            record["usedAt"] = datetime.now(timezone.utc).isoformat()
+            try:
+                self._tokens.upsert_entity(entity=record, mode=UpdateMode.REPLACE)
+            except Exception as exc:
+                logger.error("Failed to mark token used: %s", exc)
 
 
 # ---------------------------------------------------------------------------
