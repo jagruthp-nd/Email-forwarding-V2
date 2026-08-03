@@ -9,8 +9,9 @@ Usage
   # Set your SMTP password in the env (never hardcode it):
   export SENDER_PASSWORD="your-app-password-here"
 
-  # Optionally set the SDP link (shows the button if set):
-  export SDP_TICKET_URL="https://netradyne.service-now.com/..."
+  # Optionally set the ServiceDesk link (shows the button if set):
+  export SERVICEDESK_TICKET_URL="https://itservicedesk.netradyne.com/"
+  # (SDP_TICKET_URL is still supported as a legacy alias)
 
   # Run from the project root:
   python tests/send_test_email.py

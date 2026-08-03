@@ -21,6 +21,8 @@ Configurable env vars:
 
 Account safety rules:
   - Already marked DELETED in UserTracking → SKIP
+  - deletionExempt / skipCleanupDeletion on UserTracking → SKIP
+  - DELETION_EXEMPT_USER_IDS / DELETION_EXEMPT_EMAILS app settings → SKIP
   - Account still has active email forwarding → SKIP (log warning, let daily monitor handle)
   - Account already deleted from Azure AD (soft-deleted / 404) → mark DELETED in tracking, SKIP
 """
@@ -40,6 +42,8 @@ from .graph_api   import (
     delete_user,
     get_deleted_user,
 )
+from .automation_flags import is_dry_run, log_active_gates
+from .deletion_exempt import is_automated_deletion_exempt
 
 logger = logging.getLogger(__name__)
 
@@ -64,11 +68,14 @@ def run_cleanup_scan() -> Dict[str, int]:
     store = TableStore()
     store.ensure_tables()
 
+    log_active_gates("monthly_cleanup")
+
     today = datetime.now(timezone.utc).date()
     logger.info("=== Monthly Cleanup Scan starting – %s (region=%s) ===", today.isoformat(), _CLEANUP_REGION)
 
     summary = {"checked": 0, "deleted": 0, "skipped_already_deleted": 0,
-               "skipped_has_ef": 0, "skipped_too_recent": 0, "errors": 0}
+               "skipped_has_ef": 0, "skipped_too_recent": 0, "skipped_exempt": 0,
+               "dry_run": 0, "errors": 0}
 
     # Build a fast lookup of what's already tracked
     all_tracked = {r["userId"]: r for r in store.list_all_users()}
@@ -146,10 +153,11 @@ def run_cleanup_scan() -> Dict[str, int]:
 
     logger.info(
         "=== Cleanup Scan complete – checked=%d deleted=%d "
-        "skip_deleted=%d skip_ef=%d skip_recent=%d errors=%d ===",
+        "skip_deleted=%d skip_ef=%d skip_recent=%d skip_exempt=%d dry_run=%d errors=%d ===",
         summary["checked"],   summary["deleted"],
         summary["skipped_already_deleted"], summary["skipped_has_ef"],
-        summary["skipped_too_recent"],      summary["errors"],
+        summary["skipped_too_recent"], summary["skipped_exempt"],
+        summary["dry_run"], summary["errors"],
     )
     return summary
 
@@ -167,8 +175,28 @@ def _delete_stale(
     """
     Delete one stale account if safe to do so.
 
-    Returns: 'deleted' | 'skipped_already_deleted' | 'skipped_has_ef' | 'error'
+    Returns: 'deleted' | 'skipped_already_deleted' | 'skipped_has_ef' | 'skipped_exempt' | 'dry_run' | 'error'
     """
+    exempt, exempt_reason = is_automated_deletion_exempt(
+        user_id, record, user_email=record.get("userEmail", ""),
+    )
+    if exempt:
+        logger.info(
+            "Cleanup skip (exempt=%s) userId=%s source=%s",
+            exempt_reason, user_id, source,
+        )
+        store.append_audit(
+            user_id,
+            "CLEANUP_SKIPPED_EXEMPT",
+            f"source={source} exempt={exempt_reason}",
+        )
+        return "skipped_exempt"
+
+    if is_dry_run():
+        logger.info("DRY_RUN: would cleanup-delete userId=%s source=%s", user_id, source)
+        store.append_audit(user_id, "DRY_RUN_WOULD_CLEANUP_DELETE", f"source={source}")
+        return "dry_run"
+
     # Check if account is already soft-deleted in Azure AD
     if get_deleted_user(user_id) is not None:
         logger.info("userId=%s already in recycle bin – marking DELETED in tracking", user_id)
@@ -217,6 +245,10 @@ def _tally(summary: Dict[str, int], result: str) -> None:
         summary["skipped_already_deleted"] += 1
     elif result == "skipped_has_ef":
         summary["skipped_has_ef"] += 1
+    elif result == "skipped_exempt":
+        summary["skipped_exempt"] += 1
+    elif result == "dry_run":
+        summary["dry_run"] += 1
     elif result == "error":
         summary["errors"] += 1
 

@@ -76,8 +76,12 @@ from .email_sender import (
     send_deletion_notice,
     send_final_deletion_notice,
     send_it_approval_notification,
+    send_no_ef_admin_notice,
 )
+from .app_config import get_admin_emails
 from .approval_webhook import generate_approval_urls
+from .automation_flags import is_dry_run, log_active_gates
+from .deletion_exempt import is_automated_deletion_exempt
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +135,9 @@ _OOO_MAX_DAYS = int(os.environ.get("OOO_MAX_DAYS", "30"))
 # IT approval mailbox for Approve/Decline notifications
 _IT_APPROVAL_EMAIL = os.environ.get("IT_APPROVAL_EMAIL", "")
 
+# Days after offboard to send a one-time NO_EF reminder to admins (0 = disabled)
+_NO_EF_ADMIN_REMINDER_DAY = int(os.environ.get("NO_EF_ADMIN_REMINDER_DAY", "28"))
+
 
 # ---------------------------------------------------------------------------
 # Entry point (called by function_app.py timer trigger)
@@ -146,6 +153,8 @@ def run_monitor() -> Dict[str, int]:
     store = TableStore()
     store.ensure_tables()
 
+    log_active_gates("monitor_accounts")
+
     today = datetime.now(timezone.utc).date()
     logger.info("=== EF Monitor starting – %s ===", today.isoformat())
 
@@ -157,7 +166,7 @@ def run_monitor() -> Dict[str, int]:
     # and carry forward their existing records.
     tracked = {r["userId"]: r for r in store.list_active_users()}
 
-    summary = {"checked": 0, "alerted": 0, "ef_removed": 0, "deleted": 0, "errors": 0, "skipped": 0}
+    summary = {"checked": 0, "alerted": 0, "ef_removed": 0, "deleted": 0, "errors": 0, "skipped": 0, "dry_run": 0}
 
     for user in ad_users:
         user_id = user.get("id", "")
@@ -175,6 +184,8 @@ def run_monitor() -> Dict[str, int]:
                 summary["deleted"] += 1
             elif action == "skipped":
                 summary["skipped"] += 1
+            elif action == "dry_run":
+                summary["dry_run"] += 1
         except Exception as exc:
             summary["errors"] += 1
             logger.error("Unhandled error for userId=%s: %s", user_id, exc, exc_info=True)
@@ -270,6 +281,7 @@ def _process_user(
     #   The monthly cleanup scan (cleanup_scan.py) is the automated safety net.
     #   Set AUTO_DELETE_NO_EF=true to revert to immediate auto-delete behaviour.
     if not ef_required:
+        _maybe_no_ef_admin_reminder(record, days_elapsed, store)
         if _AUTO_DELETE_NO_EF and days_elapsed >= _EF_REMOVE_1:
             return _do_delete(user_id, record, "NO_EF", store)
         return "no_action"
@@ -353,6 +365,14 @@ def _do_alert(
     user_id = record["userId"]
     today_str = datetime.now(timezone.utc).date().isoformat()
 
+    if is_dry_run():
+        store.append_audit(
+            user_id, "DRY_RUN_WOULD_ALERT",
+            f"days_remaining={days_remaining} final={is_final}",
+        )
+        logger.info("DRY_RUN: would send EF alert for userId=%s", user_id)
+        return "dry_run"
+
     ok = send_ef_alert(record, days_remaining=max(days_remaining, 1), is_final=is_final)
 
     # Mark the Azure AD user profile so IT can see the alert has been sent.
@@ -407,6 +427,14 @@ def _do_remove_ef(
     """
     today_str = datetime.now(timezone.utc).date().isoformat()
 
+    if is_dry_run():
+        store.append_audit(
+            user_id, "DRY_RUN_WOULD_DISABLE_EF",
+            f"reason={reason} days_until_delete={days_until_delete}",
+        )
+        logger.info("DRY_RUN: would disable EF for userId=%s", user_id)
+        return "dry_run"
+
     # Disable forwarding via Graph API
     disable_email_forwarding(user_id)
 
@@ -441,6 +469,19 @@ def _do_delete(
     is_final: bool = False,
 ) -> str:
     today_str = datetime.now(timezone.utc).date().isoformat()
+
+    exempt, exempt_reason = is_automated_deletion_exempt(user_id, record)
+    if exempt:
+        logger.info(
+            "userId=%s automated deletion SKIPPED (exempt=%s) reason=%s",
+            user_id, exempt_reason, reason,
+        )
+        store.append_audit(
+            user_id,
+            "DELETE_SKIPPED_EXEMPT",
+            f"reason={reason}. exempt={exempt_reason}. Manual deletion or remove exemption when ready.",
+        )
+        return "no_action"
 
     # ── Region gate ──────────────────────────────────────────────────────────
     # Government compliance: only delete accounts in the permitted region.
@@ -477,6 +518,11 @@ def _do_delete(
             return "no_action"
     except Exception as exc:
         logger.error("userId=%s litigation hold check failed: %s – proceeding with caution", user_id, exc)
+
+    if is_dry_run():
+        store.append_audit(user_id, "DRY_RUN_WOULD_DELETE", f"reason={reason}")
+        logger.info("DRY_RUN: would delete userId=%s reason=%s", user_id, reason)
+        return "dry_run"
 
     # Perform the Azure AD soft-delete
     ok = delete_user(user_id)
@@ -704,6 +750,9 @@ def _create_record(
         "legalHoldChecked":    "",
         "legalHoldActive":     False,
         "licensesRemovedDate": "",
+        "deletionExempt":      False,
+        "noEfAdminNotifiedDate": "",
+        "noEfAdminReminderDate": "",
     }
 
     store.upsert_user(record)
@@ -735,12 +784,70 @@ def _create_record(
     # Create initial ComplianceExport record
     _update_compliance_from_record(record, store, firstSeenDate=offboard_date.isoformat())
 
+    if not ef_required:
+        _notify_no_ef_admins_on_register(record, store)
+
     return record
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _notify_no_ef_admins_on_register(record: Dict[str, Any], store: TableStore) -> None:
+    """One-time admin notice when a NO_EF account enters tracking."""
+    if not get_admin_emails():
+        return
+    user_id = record.get("userId", "")
+    if record.get("noEfAdminNotifiedDate"):
+        return
+    sent = send_no_ef_admin_notice(record, event="registered")
+    today_str = datetime.now(timezone.utc).date().isoformat()
+    record["noEfAdminNotifiedDate"] = today_str
+    store.upsert_user(record)
+    store.append_email_log(
+        user_id=user_id,
+        email_type="NO_EF_ADMIN",
+        recipient="ADMIN_EMAILS",
+        subject=f"NO EF registered – {record.get('displayName', '')}",
+        status="SENT" if sent else "SUPPRESSED",
+    )
+    store.append_audit(user_id, "NO_EF_ADMIN_NOTICE", "Admin notified: account has no email forwarding.")
+
+
+def _maybe_no_ef_admin_reminder(
+    record: Dict[str, Any],
+    days_elapsed: int,
+    store: TableStore,
+) -> None:
+    """Optional one-time reminder before monthly cleanup may delete the account."""
+    if _NO_EF_ADMIN_REMINDER_DAY <= 0:
+        return
+    if record.get("noEfAdminReminderDate"):
+        return
+    if days_elapsed < _NO_EF_ADMIN_REMINDER_DAY:
+        return
+    if record.get("statusCode") == "DELETED":
+        return
+
+    cleanup_min = int(os.environ.get("CLEANUP_MIN_OFFBOARD_DAYS", "30"))
+    days_until = max(cleanup_min - days_elapsed, 0)
+    user_id = record.get("userId", "")
+    sent = send_no_ef_admin_notice(
+        record,
+        event="reminder",
+        days_elapsed=days_elapsed,
+        days_until_cleanup=days_until,
+    )
+    today_str = datetime.now(timezone.utc).date().isoformat()
+    record["noEfAdminReminderDate"] = today_str
+    store.upsert_user(record)
+    store.append_audit(
+        user_id,
+        "NO_EF_ADMIN_REMINDER",
+        f"Admin reminder at day {days_elapsed}. sent={sent}",
+    )
+
 
 def _bool(value: Any) -> bool:
     """Coerce various truthy representations from Table Storage to bool."""

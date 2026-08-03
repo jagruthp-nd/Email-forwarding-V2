@@ -30,6 +30,15 @@
     "DELETE_REGION":         "IN",
 
     "SDP_TICKET_URL":        "<servicedesk-extension-request-template-url>",
+    "SERVICEDESK_TICKET_URL": "<same-as-SDP_TICKET_URL-preferred-name>",
+
+    "EF_DRY_RUN":              "false",
+    "DISABLE_OUTBOUND_EMAIL":  "false",
+    "DISABLE_GRAPH_WRITES":    "false",
+
+    "NO_EF_ADMIN_REMINDER_DAY": "28",
+    "DELETION_EXEMPT_USER_IDS": "",
+    "DELETION_EXEMPT_EMAILS":   "",
 
     "CSA_ATTRIBUTE_SET":     "EFAutomation",
     "CSA_ATTRIBUTE_NAME":    "ExtStatus",

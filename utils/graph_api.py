@@ -86,6 +86,11 @@ def _get(url: str) -> Optional[Dict]:
 
 def _delete(url: str) -> bool:
     """HTTP DELETE; returns True on 204 No Content."""
+    from .automation_flags import is_graph_write_disabled
+
+    if is_graph_write_disabled():
+        logger.info("DISABLE_GRAPH_WRITES/EF_DRY_RUN: skipped DELETE %s", url)
+        return True
     try:
         resp = requests.delete(url, headers=_auth_headers(), timeout=30)
         return resp.status_code == 204
@@ -96,6 +101,11 @@ def _delete(url: str) -> bool:
 
 def _patch(url: str, payload: Dict) -> bool:
     """HTTP PATCH; returns True on 200 or 204."""
+    from .automation_flags import is_graph_write_disabled
+
+    if is_graph_write_disabled():
+        logger.info("DISABLE_GRAPH_WRITES/EF_DRY_RUN: skipped PATCH %s", url)
+        return True
     try:
         resp = requests.patch(
             url, headers=_auth_headers(), json=payload, timeout=30
@@ -108,6 +118,11 @@ def _patch(url: str, payload: Dict) -> bool:
 
 def _post(url: str, payload: Optional[Dict] = None) -> Optional[Dict]:
     """HTTP POST; returns JSON body or None."""
+    from .automation_flags import is_graph_write_disabled
+
+    if is_graph_write_disabled():
+        logger.info("DISABLE_GRAPH_WRITES/EF_DRY_RUN: skipped POST %s", url)
+        return {}
     try:
         resp = requests.post(
             url, headers=_auth_headers(), json=payload or {}, timeout=30

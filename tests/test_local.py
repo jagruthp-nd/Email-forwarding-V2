@@ -505,3 +505,59 @@ class TestWorkflowBAttributeExtension:
             result = self._run_process(ad, today, store, record)
         assert result == "ef_removed"
         mock_del.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Tests: deletion exempt + dry-run gates
+# ---------------------------------------------------------------------------
+
+class TestDeletionExemptAndDryRun:
+    def test_delete_skipped_when_deletion_exempt_on_record(self):
+        store = MagicMock()
+        store.get_compliance_record.return_value = None
+        record = make_record(offboard_days_ago=46, ef_required=True, extension_count=0, status="EF_DISABLED")
+        record["deletionExempt"] = True
+        today = date.today()
+        with patch("utils.monitor_accounts.delete_user") as mock_del:
+            from utils.monitor_accounts import _process_user
+            ad = make_ad_user(46)
+            result = _process_user(ad, today, store, record)
+        assert result == "no_action"
+        mock_del.assert_not_called()
+        store.append_audit.assert_called()
+        assert store.append_audit.call_args[0][1] == "DELETE_SKIPPED_EXEMPT"
+
+    def test_cleanup_skips_exempt_user_via_env(self, monkeypatch):
+        monkeypatch.setenv("DELETION_EXEMPT_USER_IDS", "user-001")
+        store = MagicMock()
+        record = make_record(offboard_days_ago=35, ef_required=False)
+        from utils.cleanup_scan import _delete_stale
+        with patch("utils.cleanup_scan.delete_user") as mock_del:
+            result = _delete_stale("user-001", record, store, source="test")
+        assert result == "skipped_exempt"
+        mock_del.assert_not_called()
+
+    def test_dry_run_blocks_cleanup_delete(self, monkeypatch):
+        monkeypatch.setenv("EF_DRY_RUN", "true")
+        store = MagicMock()
+        record = make_record(offboard_days_ago=35, ef_required=False)
+        from utils.cleanup_scan import _delete_stale
+        with patch("utils.cleanup_scan.delete_user") as mock_del:
+            result = _delete_stale("user-999", record, store, source="test")
+        assert result == "dry_run"
+        mock_del.assert_not_called()
+
+    def test_outbound_email_suppressed_without_smtp(self, monkeypatch):
+        monkeypatch.setenv("DISABLE_OUTBOUND_EMAIL", "true")
+        monkeypatch.delenv("EF_DRY_RUN", raising=False)
+        with patch("utils.email_sender.smtplib.SMTP") as mock_smtp:
+            from utils.email_sender import _send
+            ok = _send("test@example.com", "subject", "<p>hi</p>")
+        assert ok is True
+        mock_smtp.assert_not_called()
+
+    def test_servicedesk_url_prefers_servicedesk_env(self, monkeypatch):
+        monkeypatch.setenv("SERVICEDESK_TICKET_URL", "https://sd.example/primary")
+        monkeypatch.setenv("SDP_TICKET_URL", "https://sd.example/legacy")
+        from utils.app_config import get_servicedesk_ticket_url
+        assert get_servicedesk_ticket_url() == "https://sd.example/primary"

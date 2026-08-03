@@ -33,6 +33,9 @@ from typing import Any, Dict, List, Optional
 from azure.identity import DefaultAzureCredential
 from azure.keyvault.secrets import SecretClient
 
+from .app_config import get_admin_emails, get_servicedesk_ticket_url
+from .automation_flags import is_outbound_email_disabled
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -86,6 +89,15 @@ def _send(
 
     Returns True on success, False on failure (caller logs the reason).
     """
+    if is_outbound_email_disabled():
+        logger.info(
+            "Outbound email suppressed (EF_DRY_RUN / DISABLE_OUTBOUND_EMAIL): "
+            "would send to %s | %s",
+            to_address,
+            subject,
+        )
+        return True
+
     sender = os.environ.get("SENDER_EMAIL", "it-automation-service@netradyne.com")
     smtp_server = os.environ.get("SMTP_SERVER", "smtp.office365.com")
     smtp_port   = int(os.environ.get("SMTP_PORT", "587"))
@@ -142,8 +154,8 @@ def send_ef_alert(record: Dict[str, Any], days_remaining: int, is_final: bool = 
         logger.warning("No manager email for userId=%s – skipping alert", record.get("userId"))
         return False
 
-    it_email      = os.environ.get("IT_EMAIL", "it-operations@netradyne.com")
-    sdp_ticket_url = os.environ.get("SDP_TICKET_URL", "")
+    it_email       = os.environ.get("IT_EMAIL", "it-operations@netradyne.com")
+    sdp_ticket_url = get_servicedesk_ticket_url()
     employee_name = record.get("displayName", "the terminated employee")
     employee_mail = record.get("userEmail", "")
     offboard_date = record.get("offboardDate", "")
@@ -267,8 +279,8 @@ def send_ef_removed_notice(record: Dict[str, Any], days_until_delete: int, reaso
     if not manager_email:
         return False
 
-    it_email      = os.environ.get("IT_EMAIL", "it-operations@netradyne.com")
-    sdp_ticket_url = os.environ.get("SDP_TICKET_URL", "")
+    it_email       = os.environ.get("IT_EMAIL", "it-operations@netradyne.com")
+    sdp_ticket_url = get_servicedesk_ticket_url()
     employee_name = record.get("displayName", "the terminated employee")
     employee_mail = record.get("userEmail", "")
     delete_date   = record.get("deleteDate", "")
@@ -767,6 +779,85 @@ def send_it_approval_notification(
 </html>"""
 
     return _send(it_approval_email, subject, html, cc_address=None)
+
+
+def send_no_ef_admin_notice(
+    record: Dict[str, Any],
+    *,
+    event: str = "registered",
+    days_elapsed: int = 0,
+    days_until_cleanup: Optional[int] = None,
+) -> int:
+    """
+    Notify ADMIN_EMAILS that a terminated account has no email forwarding.
+
+    event: 'registered' | 'reminder'
+    Returns count of admin inboxes successfully sent (0 if none configured).
+    """
+    admins = get_admin_emails()
+    if not admins:
+        logger.warning(
+            "NO_EF admin notice skipped for userId=%s – ADMIN_EMAILS not set",
+            record.get("userId"),
+        )
+        return 0
+
+    name = record.get("displayName", "Unknown user")
+    email = record.get("userEmail", "")
+    offboard = record.get("offboardDate", "")
+    user_id = record.get("userId", "")
+    region = record.get("usageLocation", "")
+
+    if event == "reminder":
+        subject = f"[NO EF] Manual deletion reminder – {name} (day {days_elapsed})"
+        intro = (
+            f"This account still has <strong>no email forwarding</strong> and has not been "
+            f"deleted. It has been <strong>{days_elapsed} days</strong> since offboarding."
+        )
+        if days_until_cleanup is not None:
+            intro += (
+                f" The monthly cleanup job may delete it in approximately "
+                f"<strong>{days_until_cleanup} days</strong> unless exempted or deleted manually."
+            )
+    else:
+        subject = f"[NO EF] New terminated account – manual deletion required – {name}"
+        intro = (
+            "A newly tracked terminated account was registered with "
+            "<strong>no active email forwarding</strong>. "
+            "Per policy, IT should delete this account during offboarding; "
+            "the monthly cleanup scan is the automated safety net."
+        )
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"></head>
+<body style="font-family:Segoe UI,Arial,sans-serif;color:#333;max-width:640px;margin:auto;padding:20px;">
+  <div style="background:#6c757d;color:#fff;padding:20px;border-radius:6px 6px 0 0;">
+    <h2 style="margin:0;font-size:18px;">No Email Forwarding – Admin Notice</h2>
+  </div>
+  <div style="background:#f8f9fa;padding:20px;border:1px solid #dee2e6;border-top:none;border-radius:0 0 6px 6px;">
+    <p>{intro}</p>
+    <table style="width:100%;border-collapse:collapse;font-size:14px;">
+      <tr><td style="padding:6px 0;color:#666;">Employee</td><td><strong>{name}</strong> ({email})</td></tr>
+      <tr><td style="padding:6px 0;color:#666;">Offboard date</td><td>{offboard}</td></tr>
+      <tr><td style="padding:6px 0;color:#666;">Region</td><td>{region or '—'}</td></tr>
+      <tr><td style="padding:6px 0;color:#666;">Object ID</td><td style="font-size:12px;">{user_id}</td></tr>
+    </table>
+    <p style="font-size:13px;color:#666;margin-top:16px;">
+      To exclude an account from automated cleanup deletion, set
+      <code>deletionExempt=true</code> on the UserTracking row or add the user to
+      <strong>DELETION_EXEMPT_USER_IDS</strong> / <strong>DELETION_EXEMPT_EMAILS</strong>
+      in Function App settings.
+    </p>
+  </div>
+</body>
+</html>"""
+
+    sent = 0
+    for admin in admins:
+        if _send(admin, subject, html):
+            sent += 1
+    return sent
 
 
 def send_final_deletion_notice(record: Dict[str, Any]) -> bool:
