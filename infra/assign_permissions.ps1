@@ -27,10 +27,13 @@ $requiredRoles = @(
     "Directory.Read.All",                       # Read terminated users from Azure AD
     "User.ReadWrite.All",                       # Delete user accounts + remove licenses (POST /users/{id}/assignLicense)
     "MailboxSettings.ReadWrite",                # Read/update mailbox forwarding + OOO settings
-    "CustomSecAttributeAssignment.ReadWrite.All" # Read/write Custom Security Attributes (Workflow B)
+    "CustomSecAttributeAssignment.ReadWrite.All", # Read/write Custom Security Attributes (Workflow B)
+    "Mail.Send"                                 # Send mail as SENDER_EMAIL via Graph (no SMTP password)
     # Note: User.Read.All is covered by User.ReadWrite.All (superset).
     # The Graph beta endpoint /users/{id}?$select=inPlaceHolds (litigation hold check)
     # requires User.Read.All which is already included in User.ReadWrite.All.
+    # Mail.Send is application permission – also restrict send-as mailbox via
+    # Exchange Application Access Policy if your tenant requires it.
 )
 
 foreach ($roleName in $requiredRoles) {
@@ -107,4 +110,9 @@ Write-Host "" -ForegroundColor Yellow
 Write-Host "  Step 6 – Litigation hold check (Graph beta):" -ForegroundColor Yellow
 Write-Host "    GET /beta/users/{id}?`$select=inPlaceHolds requires User.Read.All," -ForegroundColor Yellow
 Write-Host "    which is a subset of User.ReadWrite.All (already assigned above)." -ForegroundColor Yellow
+Write-Host "" -ForegroundColor Yellow
+Write-Host "  Step 7 – Mail.Send (application):" -ForegroundColor Yellow
+Write-Host "    Emails are sent via Graph POST /users/{SENDER_EMAIL}/sendMail." -ForegroundColor Yellow
+Write-Host "    Ensure SENDER_EMAIL mailbox exists and, if required by your tenant," -ForegroundColor Yellow
+Write-Host "    create an Exchange Application Access Policy limiting send-as to that mailbox." -ForegroundColor Yellow
 Write-Host "============================================================" -ForegroundColor Cyan

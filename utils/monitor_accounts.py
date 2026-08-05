@@ -46,7 +46,7 @@ from __future__ import annotations
 import logging
 import os
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .table_store  import TableStore
 from .graph_api    import (
@@ -76,11 +76,10 @@ from .email_sender import (
     send_deletion_notice,
     send_final_deletion_notice,
     send_it_approval_notification,
-    send_no_ef_admin_notice,
+    send_offboard_consolidated_report,
 )
-from .app_config import get_admin_emails
 from .approval_webhook import generate_approval_urls
-from .automation_flags import is_dry_run, log_active_gates
+from .automation_flags import is_dry_run, log_active_gates, resolve_ooo_contact
 from .deletion_exempt import is_automated_deletion_exempt
 
 logger = logging.getLogger(__name__)
@@ -166,7 +165,12 @@ def run_monitor() -> Dict[str, int]:
     # and carry forward their existing records.
     tracked = {r["userId"]: r for r in store.list_active_users()}
 
-    summary = {"checked": 0, "alerted": 0, "ef_removed": 0, "deleted": 0, "errors": 0, "skipped": 0, "dry_run": 0}
+    summary: Dict[str, int] = {
+        "checked": 0, "alerted": 0, "ef_removed": 0, "deleted": 0,
+        "errors": 0, "skipped": 0, "dry_run": 0, "report_sent": 0,
+    }
+    # Accumulator for one consolidated IT report (no per-user admin emails)
+    report_ctx: Dict[str, Any] = {"new_no_ef": [], "new_with_ef": []}
 
     for user in ad_users:
         user_id = user.get("id", "")
@@ -175,7 +179,7 @@ def run_monitor() -> Dict[str, int]:
 
         try:
             summary["checked"] += 1
-            action = _process_user(user, today, store, tracked.get(user_id))
+            action = _process_user(user, today, store, tracked.get(user_id), report_ctx)
             if action == "alerted":
                 summary["alerted"] += 1
             elif action == "ef_removed":
@@ -190,10 +194,35 @@ def run_monitor() -> Dict[str, int]:
             summary["errors"] += 1
             logger.error("Unhandled error for userId=%s: %s", user_id, exc, exc_info=True)
 
+    overdue = _collect_overdue_no_ef(store, today)
+    try:
+        sent = send_offboard_consolidated_report(
+            report_date=today.isoformat(),
+            new_no_ef=report_ctx["new_no_ef"],
+            new_with_ef=report_ctx["new_with_ef"],
+            overdue_no_ef=overdue,
+            summary=summary,
+        )
+        summary["report_sent"] = sent
+        if sent:
+            store.append_email_log(
+                user_id="DAILY_REPORT",
+                email_type="OFFBOARD_REPORT",
+                recipient="REPORT_EMAILS",
+                subject=f"Daily offboard report – {today.isoformat()}",
+                status="SENT",
+            )
+    except Exception as exc:
+        summary["errors"] += 1
+        logger.error("Consolidated offboard report failed: %s", exc, exc_info=True)
+
     logger.info(
-        "=== EF Monitor complete – checked=%d alerted=%d ef_removed=%d deleted=%d errors=%d skipped=%d ===",
+        "=== EF Monitor complete – checked=%d alerted=%d ef_removed=%d deleted=%d "
+        "errors=%d skipped=%d report_sent=%d new_no_ef=%d new_ef=%d overdue_no_ef=%d ===",
         summary["checked"], summary["alerted"], summary["ef_removed"],
-        summary["deleted"], summary["errors"],  summary["skipped"],
+        summary["deleted"], summary["errors"], summary["skipped"],
+        summary["report_sent"],
+        len(report_ctx["new_no_ef"]), len(report_ctx["new_with_ef"]), len(overdue),
     )
     return summary
 
@@ -207,6 +236,7 @@ def _process_user(
     today: date,
     store: TableStore,
     existing_record: Optional[Dict[str, Any]],
+    report_ctx: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Evaluate and act on one terminated user.
@@ -247,13 +277,27 @@ def _process_user(
         return "skipped"
 
     # ── 2. Get or create tracking record ───────────────────────────────────
-    record = existing_record or _create_record(user, offboard_date, store)
+    is_new = existing_record is None
+    record = existing_record or _create_record(user, offboard_date, store, report_ctx)
     if record is None:
         return "skipped"
 
     # ── 3. Skip already-deleted ─────────────────────────────────────────────
     if record.get("statusCode") == "DELETED":
         return "skipped"
+
+    # Re-detect EF if previously unknown (e.g. MailboxSettings permission just granted)
+    if not is_new and not _bool(record.get("efRequired", False)):
+        try:
+            if has_email_forwarding(user_id):
+                fwd = get_forwarding_address(user_id) or ""
+                record["efRequired"] = True
+                record["forwardingAddress"] = fwd
+                store.upsert_user(record)
+                store.append_audit(user_id, "EF_DETECTED", "Forwarding detected on re-check; switching to EF path.")
+                logger.info("userId=%s EF detected on re-check", user_id)
+        except Exception as exc:
+            logger.warning("userId=%s EF re-check failed: %s", user_id, exc)
 
     ef_required  = _bool(record.get("efRequired", False))
     ext_count    = int(record.get("extensionCount", 0))
@@ -280,8 +324,8 @@ def _process_user(
     #   India policy: IT deletes NO_EF accounts manually during offboarding.
     #   The monthly cleanup scan (cleanup_scan.py) is the automated safety net.
     #   Set AUTO_DELETE_NO_EF=true to revert to immediate auto-delete behaviour.
+    #   Admin notice is via daily consolidated report (not per-user email).
     if not ef_required:
-        _maybe_no_ef_admin_reminder(record, days_elapsed, store)
         if _AUTO_DELETE_NO_EF and days_elapsed >= _EF_REMOVE_1:
             return _do_delete(user_id, record, "NO_EF", store)
         return "no_action"
@@ -700,6 +744,7 @@ def _create_record(
     user: Dict[str, Any],
     offboard_date: date,
     store: TableStore,
+    report_ctx: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Build and persist a new UserTracking record for a user seen for the first time.
@@ -765,15 +810,16 @@ def _create_record(
         "Registered new user userId=%s ef=%s offboard=%s", user_id, ef_required, offboard_date
     )
 
-    # Set OOO on first registration (only if not already active)
+    # Set OOO on first registration (internal-only; test mode uses prem_testing as contact)
     try:
         if not is_auto_reply_enabled(user_id):
-            manager_name = manager_obj.get("displayName", "") or manager_email
-            ooo_ok = set_auto_reply(user_id, manager_name=manager_name, manager_email=manager_email)
+            mgr_name = manager_obj.get("displayName", "") or manager_email
+            ooo_name, ooo_email = resolve_ooo_contact(mgr_name, manager_email)
+            ooo_ok = set_auto_reply(user_id, manager_name=ooo_name, manager_email=ooo_email)
             if ooo_ok:
                 record["oooSetDate"] = offboard_date.isoformat()
                 store.upsert_user(record)
-                logger.info("OOO set for userId=%s (manager: %s)", user_id, manager_email)
+                logger.info("OOO set (internal-only) for userId=%s contact=%s", user_id, ooo_email)
         else:
             record["oooSetDate"] = offboard_date.isoformat()
             store.upsert_user(record)
@@ -784,8 +830,19 @@ def _create_record(
     # Create initial ComplianceExport record
     _update_compliance_from_record(record, store, firstSeenDate=offboard_date.isoformat())
 
-    if not ef_required:
-        _notify_no_ef_admins_on_register(record, store)
+    if report_ctx is not None:
+        row = {
+            "displayName": record.get("displayName", ""),
+            "userEmail": record.get("userEmail", ""),
+            "offboardDate": record.get("offboardDate", ""),
+            "usageLocation": record.get("usageLocation", ""),
+            "managerEmail": record.get("managerEmail", ""),
+            "userId": user_id,
+        }
+        if ef_required:
+            report_ctx.setdefault("new_with_ef", []).append(row)
+        else:
+            report_ctx.setdefault("new_no_ef", []).append(row)
 
     return record
 
@@ -794,59 +851,34 @@ def _create_record(
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _notify_no_ef_admins_on_register(record: Dict[str, Any], store: TableStore) -> None:
-    """One-time admin notice when a NO_EF account enters tracking."""
-    if not get_admin_emails():
-        return
-    user_id = record.get("userId", "")
-    if record.get("noEfAdminNotifiedDate"):
-        return
-    sent = send_no_ef_admin_notice(record, event="registered")
-    today_str = datetime.now(timezone.utc).date().isoformat()
-    record["noEfAdminNotifiedDate"] = today_str
-    store.upsert_user(record)
-    store.append_email_log(
-        user_id=user_id,
-        email_type="NO_EF_ADMIN",
-        recipient="ADMIN_EMAILS",
-        subject=f"NO EF registered – {record.get('displayName', '')}",
-        status="SENT" if sent else "SUPPRESSED",
-    )
-    store.append_audit(user_id, "NO_EF_ADMIN_NOTICE", "Admin notified: account has no email forwarding.")
-
-
-def _maybe_no_ef_admin_reminder(
-    record: Dict[str, Any],
-    days_elapsed: int,
-    store: TableStore,
-) -> None:
-    """Optional one-time reminder before monthly cleanup may delete the account."""
+def _collect_overdue_no_ef(store: TableStore, today: date) -> List[Dict[str, Any]]:
+    """NO_EF accounts past NO_EF_ADMIN_REMINDER_DAY still active (for consolidated report)."""
     if _NO_EF_ADMIN_REMINDER_DAY <= 0:
-        return
-    if record.get("noEfAdminReminderDate"):
-        return
-    if days_elapsed < _NO_EF_ADMIN_REMINDER_DAY:
-        return
-    if record.get("statusCode") == "DELETED":
-        return
-
-    cleanup_min = int(os.environ.get("CLEANUP_MIN_OFFBOARD_DAYS", "30"))
-    days_until = max(cleanup_min - days_elapsed, 0)
-    user_id = record.get("userId", "")
-    sent = send_no_ef_admin_notice(
-        record,
-        event="reminder",
-        days_elapsed=days_elapsed,
-        days_until_cleanup=days_until,
-    )
-    today_str = datetime.now(timezone.utc).date().isoformat()
-    record["noEfAdminReminderDate"] = today_str
-    store.upsert_user(record)
-    store.append_audit(
-        user_id,
-        "NO_EF_ADMIN_REMINDER",
-        f"Admin reminder at day {days_elapsed}. sent={sent}",
-    )
+        return []
+    overdue: List[Dict[str, Any]] = []
+    for record in store.list_active_users():
+        if _bool(record.get("efRequired", False)):
+            continue
+        if record.get("statusCode") == "DELETED":
+            continue
+        try:
+            offboard = date.fromisoformat(record.get("offboardDate", ""))
+        except ValueError:
+            continue
+        days = (today - offboard).days
+        if days < _NO_EF_ADMIN_REMINDER_DAY:
+            continue
+        overdue.append({
+            "displayName": record.get("displayName", ""),
+            "userEmail": record.get("userEmail", ""),
+            "offboardDate": record.get("offboardDate", ""),
+            "usageLocation": record.get("usageLocation", ""),
+            "managerEmail": record.get("managerEmail", ""),
+            "userId": record.get("userId", ""),
+            "daysElapsed": days,
+        })
+    overdue.sort(key=lambda r: int(r.get("daysElapsed") or 0), reverse=True)
+    return overdue
 
 
 def _bool(value: Any) -> bool:

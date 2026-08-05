@@ -547,17 +547,76 @@ class TestDeletionExemptAndDryRun:
         assert result == "dry_run"
         mock_del.assert_not_called()
 
-    def test_outbound_email_suppressed_without_smtp(self, monkeypatch):
+    def test_outbound_email_suppressed_without_graph(self, monkeypatch):
         monkeypatch.setenv("DISABLE_OUTBOUND_EMAIL", "true")
         monkeypatch.delenv("EF_DRY_RUN", raising=False)
-        with patch("utils.email_sender.smtplib.SMTP") as mock_smtp:
+        with patch("utils.email_sender.send_mail") as mock_send:
             from utils.email_sender import _send
             ok = _send("test@example.com", "subject", "<p>hi</p>")
         assert ok is True
-        mock_smtp.assert_not_called()
+        mock_send.assert_not_called()
 
     def test_servicedesk_url_prefers_servicedesk_env(self, monkeypatch):
         monkeypatch.setenv("SERVICEDESK_TICKET_URL", "https://sd.example/primary")
         monkeypatch.setenv("SDP_TICKET_URL", "https://sd.example/legacy")
         from utils.app_config import get_servicedesk_ticket_url
         assert get_servicedesk_ticket_url() == "https://sd.example/primary"
+
+    def test_consolidated_report_uses_report_emails_and_sharepoint(self, monkeypatch):
+        monkeypatch.setenv("REPORT_EMAILS", "prem_testing@netradyne.com")
+        monkeypatch.setenv("SHAREPOINT_REPORT_URL", "https://contoso.sharepoint.com/sites/IT/Reports")
+        monkeypatch.setenv("EF_TEST_MODE", "false")
+        monkeypatch.setenv("DISABLE_OUTBOUND_EMAIL", "false")
+        monkeypatch.setenv("EF_DRY_RUN", "false")
+        monkeypatch.setenv("SENDER_EMAIL", "it-automation-service@netradyne.com")
+
+        with patch("utils.email_sender.send_mail", return_value=True) as mock_send:
+            from utils.email_sender import send_offboard_consolidated_report
+            n = send_offboard_consolidated_report(
+                report_date="2026-08-05",
+                new_no_ef=[{
+                    "displayName": "A", "userEmail": "a@x.com",
+                    "offboardDate": "2026-07-01", "usageLocation": "IN",
+                    "managerEmail": "m@x.com",
+                }],
+                new_with_ef=[],
+                overdue_no_ef=[],
+                summary={"checked": 1},
+            )
+        assert n == 1
+        html = mock_send.call_args.kwargs["html_body"]
+        assert "https://contoso.sharepoint.com/sites/IT/Reports" in html
+        assert "Open report folder in SharePoint" in html
+        assert "Daily Offboard" in mock_send.call_args.kwargs["subject"] or "offboard report" in mock_send.call_args.kwargs["subject"].lower()
+
+    def test_ooo_is_internal_only(self):
+        with patch("utils.graph_api._patch", return_value=True) as mock_patch:
+            from utils.graph_api import set_auto_reply
+            ok = set_auto_reply("uid", "Mgr Name", "mgr@netradyne.com")
+        assert ok is True
+        payload = mock_patch.call_args[0][1]
+        setting = payload["automaticRepliesSetting"]
+        assert setting["externalAudience"] == "none"
+        assert setting["externalReplyMessage"] == ""
+        assert "mgr@netradyne.com" in setting["internalReplyMessage"]
+
+    def test_ef_test_mode_redirects_to_and_strips_cc(self, monkeypatch):
+        monkeypatch.setenv("EF_TEST_MODE", "true")
+        monkeypatch.setenv("EF_TEST_RECIPIENT", "prem_testing@netradyne.com")
+        monkeypatch.setenv("DISABLE_OUTBOUND_EMAIL", "false")
+        monkeypatch.setenv("EF_DRY_RUN", "false")
+        monkeypatch.setenv("SENDER_EMAIL", "it-automation-service@netradyne.com")
+
+        with patch("utils.email_sender.send_mail", return_value=True) as mock_send:
+            from utils.email_sender import _send
+            ok = _send(
+                "manager@netradyne.com",
+                "Test subject",
+                "<p>hi</p>",
+                cc_address="it-operations@netradyne.com",
+            )
+        assert ok is True
+        mock_send.assert_called_once()
+        kwargs = mock_send.call_args.kwargs
+        assert kwargs["to_address"] == "prem_testing@netradyne.com"
+        assert kwargs["cc_address"] is None

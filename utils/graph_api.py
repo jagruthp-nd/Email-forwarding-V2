@@ -11,6 +11,7 @@ Required Graph API application permissions (granted via assign_permissions.ps1):
   - User.ReadWrite.All                       : delete accounts
   - MailboxSettings.ReadWrite                : read & clear mailbox forwarding
   - CustomSecAttributeAssignment.ReadWrite.All : read/write Custom Security Attributes
+  - Mail.Send                                : send mail as SENDER_EMAIL (no SMTP password)
 
 Workflow B note:
   The extension approval signal is stored as a Custom Security Attribute (CSA):
@@ -71,13 +72,20 @@ def _auth_headers() -> Dict[str, str]:
     }
 
 
-def _get(url: str) -> Optional[Dict]:
-    """HTTP GET with error handling."""
+def _get(url: str, *, advanced: bool = False) -> Optional[Dict]:
+    """HTTP GET with error handling.
+
+    advanced=True adds ConsistencyLevel: eventual (required for filters like
+    employeeType and some directory properties).
+    """
     try:
-        resp = requests.get(url, headers=_auth_headers(), timeout=30)
+        headers = _auth_headers()
+        if advanced:
+            headers["ConsistencyLevel"] = "eventual"
+        resp = requests.get(url, headers=headers, timeout=60)
         if resp.status_code == 200:
             return resp.json()
-        logger.warning("GET %s → %s", url, resp.status_code)
+        logger.warning("GET %s → %s %s", url, resp.status_code, (resp.text or "")[:300])
         return None
     except Exception as exc:
         logger.error("GET %s failed: %s", url, exc)
@@ -136,6 +144,57 @@ def _post(url: str, payload: Optional[Dict] = None) -> Optional[Dict]:
         return None
 
 
+def send_mail(
+    sender: str,
+    to_address: str,
+    subject: str,
+    html_body: str,
+    cc_address: Optional[str] = None,
+    *,
+    save_to_sent_items: bool = True,
+) -> bool:
+    """
+    Send HTML mail via Microsoft Graph application Mail.Send.
+
+    POST /users/{sender}/sendMail
+
+    Not gated by DISABLE_GRAPH_WRITES – outbound mail uses DISABLE_OUTBOUND_EMAIL /
+    EF_DRY_RUN / EF_TEST_MODE in email_sender instead.
+    Requires application permission Mail.Send (+ admin consent) and that the
+    app is allowed to send as *sender* (mailbox / Application Access Policy).
+    """
+    to_recipients = [{"emailAddress": {"address": to_address}}]
+    message: Dict[str, Any] = {
+        "subject": subject,
+        "body": {"contentType": "HTML", "content": html_body},
+        "toRecipients": to_recipients,
+    }
+    if cc_address:
+        message["ccRecipients"] = [{"emailAddress": {"address": cc_address}}]
+
+    payload = {
+        "message": message,
+        "saveToSentItems": save_to_sent_items,
+    }
+    url = f"{_GRAPH_BASE}/users/{sender}/sendMail"
+    try:
+        resp = requests.post(url, headers=_auth_headers(), json=payload, timeout=60)
+        # Graph sendMail returns 202 Accepted with empty body on success
+        if resp.status_code in (202, 200):
+            logger.info("Graph sendMail → %s (cc: %s) | %s", to_address, cc_address, subject)
+            return True
+        logger.error(
+            "Graph sendMail failed → %s status=%s body=%s",
+            to_address,
+            resp.status_code,
+            (resp.text or "")[:500],
+        )
+        return False
+    except Exception as exc:
+        logger.error("Graph sendMail failed → %s: %s", to_address, exc)
+        return False
+
+
 # ---------------------------------------------------------------------------
 # User queries
 # ---------------------------------------------------------------------------
@@ -148,8 +207,11 @@ def get_terminated_users() -> List[Dict[str, Any]]:
       - onPremisesExtensionAttributes/extensionAttribute10 is not null
         (the offboard date is stored there)
 
-    Manager is expanded inline so we avoid a second round-trip per user.
-    Handles pagination automatically via @odata.nextLink.
+    Handles pagination via @odata.nextLink.
+
+    Note: $expand=manager cannot be combined with the employeeType advanced
+    filter (Graph returns Request_UnsupportedQuery).  Manager is resolved
+    later via get_manager() when a tracking record is created.
     """
     select_fields = ",".join([
         "id",
@@ -163,23 +225,24 @@ def get_terminated_users() -> List[Dict[str, Any]]:
         "onPremisesExtensionAttributes",
         "customSecurityAttributes",       # EFAutomation.ExtStatus (Workflow B)
     ])
+    # employeeType filter requires Graph advanced query:
+    # ConsistencyLevel: eventual + $count=true
     filter_expr = (
         "employeeType eq 'Terminated'"
         " and accountEnabled eq false"
     )
-    expand_expr = "manager($select=id,mail,displayName,userPrincipalName)"
 
     url = (
         f"{_GRAPH_BASE}/users"
-        f"?$filter={requests.utils.quote(filter_expr)}"
+        f"?$count=true"
+        f"&$filter={requests.utils.quote(filter_expr)}"
         f"&$select={select_fields}"
-        f"&$expand={expand_expr}"
         f"&$top=999"
     )
 
     users: List[Dict] = []
     while url:
-        data = _get(url)
+        data = _get(url, advanced=True)
         if data is None:
             break
         users.extend(data.get("value", []))
@@ -463,21 +526,25 @@ def get_deleted_user(user_id: str) -> Optional[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 def set_auto_reply(user_id: str, manager_name: str, manager_email: str) -> bool:
-    """Configure OOO for a terminated user. Policy-compliant message with manager as alternate contact."""
+    """
+    Configure OOO for a terminated user (internal senders only).
+
+    externalAudience=none → no auto-reply to external/internet senders
+    (testing and production). Manager is named as the internal point of contact.
+    """
     internal_msg = (
         f"Thank you for your email. This mailbox is no longer monitored as the individual "
         f"is no longer associated with Netradyne. For business-related matters, please contact "
         f"{manager_name} at {manager_email}."
     )
-    external_msg = internal_msg  # same message externally
     return _patch(
         f"{_GRAPH_BASE}/users/{user_id}/mailboxSettings",
         {
             "automaticRepliesSetting": {
                 "status": "alwaysEnabled",
-                "externalAudience": "all",
+                "externalAudience": "none",
                 "internalReplyMessage": internal_msg,
-                "externalReplyMessage": external_msg,
+                "externalReplyMessage": "",
             }
         },
     )

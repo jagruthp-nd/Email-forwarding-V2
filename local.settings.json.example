@@ -9,12 +9,7 @@
     "AZURE_CLIENT_SECRET":   "<app-registration-client-secret>",
     "STORAGE_ACCOUNT_NAME":  "<stefautomation>",
 
-    "KEY_VAULT_NAME":        "<kv-ef-automation>",
-
-    "SMTP_SERVER":           "smtp.office365.com",
-    "SMTP_PORT":             "587",
     "SENDER_EMAIL":          "it-automation-service@netradyne.com",
-    "SENDER_PASSWORD":       "<app-password-or-leave-blank-to-use-keyvault>",
 
     "IT_EMAIL":              "it-operations@netradyne.com",
     "RECOVERY_GRACE_DAYS":   "30",
@@ -35,6 +30,12 @@
     "EF_DRY_RUN":              "false",
     "DISABLE_OUTBOUND_EMAIL":  "false",
     "DISABLE_GRAPH_WRITES":    "false",
+
+    "EF_TEST_MODE":            "true",
+    "EF_TEST_RECIPIENT":       "prem_testing@netradyne.com",
+
+    "REPORT_EMAILS":             "prem_testing@netradyne.com",
+    "SHAREPOINT_REPORT_URL":     "",
 
     "NO_EF_ADMIN_REMINDER_DAY": "28",
     "DELETION_EXEMPT_USER_IDS": "",

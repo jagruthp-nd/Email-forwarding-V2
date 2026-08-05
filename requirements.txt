@@ -4,11 +4,8 @@ azure-functions==1.*
 # Azure SDK – Table Storage
 azure-data-tables==12.*
 
-# Azure SDK – identity (Managed Identity / DefaultAzureCredential)
+# Azure SDK – identity (Managed Identity / DefaultAzureCredential / app registration)
 azure-identity==1.*
 
-# Azure SDK – Key Vault secrets (SMTP password retrieval)
-azure-keyvault-secrets==4.*
-
-# HTTP client for Microsoft Graph API calls
+# HTTP client for Microsoft Graph API calls (including Mail.Send)
 requests==2.*

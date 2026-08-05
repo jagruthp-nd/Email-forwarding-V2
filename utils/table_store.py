@@ -48,12 +48,31 @@ class TableStore:
     """Thin wrapper around the three Azure Table Storage tables."""
 
     def __init__(self) -> None:
-        account_name = os.environ["STORAGE_ACCOUNT_NAME"]
-        endpoint = f"https://{account_name}.table.core.windows.net"
-        credential = DefaultAzureCredential()
-        self._service: TableServiceClient = TableServiceClient(
-            endpoint=endpoint, credential=credential
+        # Prefer connection string (AzureWebJobsStorage) so Table access works
+        # without assigning Storage Table Data Contributor to MI / app SP.
+        # Fall back to DefaultAzureCredential + account endpoint for local MI auth.
+        conn = (
+            os.environ.get("STORAGE_CONNECTION_STRING", "").strip()
+            or os.environ.get("AzureWebJobsStorage", "").strip()
         )
+        use_conn = (
+            os.environ.get("USE_STORAGE_CONNECTION_STRING", "true").lower()
+            in ("true", "1", "yes")
+            and conn
+            and not conn.startswith("UseDevelopmentStorage")
+        )
+        if use_conn:
+            self._service = TableServiceClient.from_connection_string(conn)
+            logger.debug("TableStore using storage connection string")
+        else:
+            account_name = os.environ["STORAGE_ACCOUNT_NAME"]
+            endpoint = f"https://{account_name}.table.core.windows.net"
+            credential = DefaultAzureCredential()
+            self._service = TableServiceClient(
+                endpoint=endpoint, credential=credential
+            )
+            logger.debug("TableStore using DefaultAzureCredential for %s", account_name)
+
         self._tracking   = self._service.get_table_client(_TRACKING_TABLE)
         self._audit      = self._service.get_table_client(_AUDIT_TABLE)
         self._email      = self._service.get_table_client(_EMAIL_TABLE)

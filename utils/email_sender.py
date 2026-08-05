@@ -1,77 +1,41 @@
 """
 email_sender.py
 ---------------
-SMTP email sender using it-automation-service@netradyne.com via Office 365.
+Outbound email via Microsoft Graph Mail.Send (application permission).
 
-The SMTP password is fetched from Azure Key Vault on first use and cached
-for the lifetime of the function instance.  This avoids redundant KV calls
-on every email while still keeping the secret out of code and config files.
+Sends as SENDER_EMAIL (e.g. it-automation-service@netradyne.com) using the
+Function App managed identity or local app-registration credentials
+(AZURE_TENANT_ID / AZURE_CLIENT_ID / AZURE_CLIENT_SECRET).  No SMTP password
+or Key Vault secret is required.
 
-Six email types (Workflow B):
+Email types (Workflow B):
   ALERT              – Day ALERT_DAY_1/2/3 warning sent to manager + IT CC.
-                       Instructs manager to raise a ServiceDesk ticket with
-                       business justification; no email-reply extension.
   EF_REMOVED         – Day 30 / 60: forwarding disabled; account still alive.
-                       IT has DELETE_DAY_1/2 grace days to process late approvals.
-  EXTENSION_CONFIRM  – Confirmation sent after IT sets CSA ExtStatus to an
-                       approved value (EXTEND_TO_30 / EXTEND_TO_60 / EXTENDED_MAX).
-  DELETION_NOTICE    – Account deleted (Day DELETE_DAY_1/DELETE_DAY_2 no-extension)
-  FINAL_DELETION     – Day 90 max-policy deletion with recovery instructions
-  WEEKLY_REPORT      – Friday digest sent to admins (ADMIN_EMAILS env var)
+  EXTENSION_CONFIRM  – Confirmation after CSA ExtStatus extension approval.
+  DELETION_NOTICE    – Account deleted (Day DELETE_DAY_1/DELETE_DAY_2)
+  FINAL_DELETION     – Day 90 max-policy deletion
+  WEEKLY_REPORT      – Friday digest to ADMIN_EMAILS
+  NO_EF_ADMIN        – Admin notice for accounts without forwarding
+  IT_APPROVAL        – Approve/Decline links for IT
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import smtplib
 from datetime import datetime, timezone
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 from typing import Any, Dict, List, Optional
 
-from azure.identity import DefaultAzureCredential
-from azure.keyvault.secrets import SecretClient
-
-from .app_config import get_admin_emails, get_servicedesk_ticket_url
-from .automation_flags import is_outbound_email_disabled
+from .app_config import (
+    get_admin_emails,
+    get_report_emails,
+    get_servicedesk_ticket_url,
+    get_sharepoint_report_url,
+)
+from .automation_flags import apply_test_email_routing, is_outbound_email_disabled
+from .graph_api import send_mail
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Credential cache
-# ---------------------------------------------------------------------------
-
-_smtp_password: Optional[str] = None   # cached for instance lifetime
-
-
-def _get_smtp_password() -> str:
-    """Resolve SMTP password: env var first, Key Vault fallback."""
-    global _smtp_password
-    if _smtp_password:
-        return _smtp_password
-
-    # Prefer direct env var (handy for local testing)
-    pwd = os.environ.get("SENDER_PASSWORD", "")
-    if pwd:
-        _smtp_password = pwd
-        return _smtp_password
-
-    # Fetch from Key Vault
-    kv_name = os.environ.get("KEY_VAULT_NAME", "")
-    if not kv_name:
-        raise RuntimeError(
-            "SMTP password unavailable: set SENDER_PASSWORD env var "
-            "or KEY_VAULT_NAME pointing to a vault with secret 'smtp-password'."
-        )
-
-    credential = DefaultAzureCredential()
-    kv_url = f"https://{kv_name}.vault.azure.net"
-    client = SecretClient(vault_url=kv_url, credential=credential)
-    secret = client.get_secret("smtp-password")
-    _smtp_password = secret.value
-    logger.info("SMTP password loaded from Key Vault '%s'", kv_name)
-    return _smtp_password
 
 
 # ---------------------------------------------------------------------------
@@ -85,54 +49,30 @@ def _send(
     cc_address: Optional[str] = None,
 ) -> bool:
     """
-    Send one HTML email via Office 365 SMTP (TLS on port 587).
+    Send one HTML email via Microsoft Graph (Mail.Send).
 
     Returns True on success, False on failure (caller logs the reason).
     """
+    to_address, cc_address = apply_test_email_routing(to_address, cc_address)
+
     if is_outbound_email_disabled():
         logger.info(
             "Outbound email suppressed (EF_DRY_RUN / DISABLE_OUTBOUND_EMAIL): "
-            "would send to %s | %s",
+            "would send to %s (cc: %s) | %s",
             to_address,
+            cc_address or "",
             subject,
         )
         return True
 
     sender = os.environ.get("SENDER_EMAIL", "it-automation-service@netradyne.com")
-    smtp_server = os.environ.get("SMTP_SERVER", "smtp.office365.com")
-    smtp_port   = int(os.environ.get("SMTP_PORT", "587"))
-
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"]    = f"IT Operations <{sender}>"
-    msg["To"]      = to_address
-    if cc_address:
-        msg["Cc"] = cc_address
-
-    # Plain-text fallback
-    plain = (
-        "Your email client does not support HTML. "
-        "Please contact IT Operations for details."
+    return send_mail(
+        sender=sender,
+        to_address=to_address,
+        subject=subject,
+        html_body=html_body,
+        cc_address=cc_address,
     )
-    msg.attach(MIMEText(plain, "plain"))
-    msg.attach(MIMEText(html_body, "html"))
-
-    recipients = [to_address]
-    if cc_address:
-        recipients.append(cc_address)
-
-    try:
-        with smtplib.SMTP(smtp_server, smtp_port, timeout=30) as server:
-            server.ehlo()
-            server.starttls()
-            server.ehlo()
-            server.login(sender, _get_smtp_password())
-            server.sendmail(sender, recipients, msg.as_string())
-        logger.info("Email sent → %s (cc: %s) | %s", to_address, cc_address, subject)
-        return True
-    except Exception as exc:
-        logger.error("SMTP send failed → %s: %s", to_address, exc)
-        return False
 
 
 # ---------------------------------------------------------------------------
@@ -781,83 +721,145 @@ def send_it_approval_notification(
     return _send(it_approval_email, subject, html, cc_address=None)
 
 
-def send_no_ef_admin_notice(
-    record: Dict[str, Any],
+def send_offboard_consolidated_report(
     *,
-    event: str = "registered",
-    days_elapsed: int = 0,
-    days_until_cleanup: Optional[int] = None,
+    report_date: str,
+    new_no_ef: List[Dict[str, Any]],
+    new_with_ef: List[Dict[str, Any]],
+    overdue_no_ef: List[Dict[str, Any]],
+    summary: Optional[Dict[str, Any]] = None,
 ) -> int:
     """
-    Notify ADMIN_EMAILS that a terminated account has no email forwarding.
+    One consolidated daily report for IT / team mailbox (REPORT_EMAILS).
 
-    event: 'registered' | 'reminder'
-    Returns count of admin inboxes successfully sent (0 if none configured).
+    Replaces per-user NO_EF admin notices.  Optional SHAREPOINT_REPORT_URL is
+    hyperlinked in the email when configured.
+    Returns number of successful recipient sends.
     """
-    admins = get_admin_emails()
-    if not admins:
-        logger.warning(
-            "NO_EF admin notice skipped for userId=%s – ADMIN_EMAILS not set",
-            record.get("userId"),
-        )
+    recipients = get_report_emails()
+    if not recipients:
+        logger.warning("Consolidated offboard report skipped – REPORT_EMAILS/ADMIN_EMAILS not set")
         return 0
 
-    name = record.get("displayName", "Unknown user")
-    email = record.get("userEmail", "")
-    offboard = record.get("offboardDate", "")
-    user_id = record.get("userId", "")
-    region = record.get("usageLocation", "")
-
-    if event == "reminder":
-        subject = f"[NO EF] Manual deletion reminder – {name} (day {days_elapsed})"
-        intro = (
-            f"This account still has <strong>no email forwarding</strong> and has not been "
-            f"deleted. It has been <strong>{days_elapsed} days</strong> since offboarding."
+    summary = summary or {}
+    sp_url = get_sharepoint_report_url()
+    if sp_url:
+        sp_block = (
+            f'<p style="margin:16px 0;">'
+            f'<a href="{sp_url}" target="_blank" '
+            f'style="display:inline-block;padding:10px 18px;background:#0078d4;color:#fff;'
+            f'text-decoration:none;border-radius:4px;font-weight:bold;">'
+            f'Open report folder in SharePoint</a></p>'
+            f'<p style="font-size:12px;color:#666;">'
+            f'Archive / working copy: <a href="{sp_url}">{sp_url}</a></p>'
         )
-        if days_until_cleanup is not None:
-            intro += (
-                f" The monthly cleanup job may delete it in approximately "
-                f"<strong>{days_until_cleanup} days</strong> unless exempted or deleted manually."
-            )
     else:
-        subject = f"[NO EF] New terminated account – manual deletion required – {name}"
-        intro = (
-            "A newly tracked terminated account was registered with "
-            "<strong>no active email forwarding</strong>. "
-            "Per policy, IT should delete this account during offboarding; "
-            "the monthly cleanup scan is the automated safety net."
+        sp_block = (
+            '<p style="font-size:12px;color:#888;margin:12px 0;">'
+            'SharePoint archive link not configured yet '
+            '(set <code>SHAREPOINT_REPORT_URL</code> in App Settings).</p>'
         )
+
+    def _rows(records: List[Dict[str, Any]], extra_cols: bool = False) -> str:
+        if not records:
+            return '<tr><td colspan="5" style="padding:10px;color:#666;">None</td></tr>'
+        parts = []
+        for r in records:
+            days = r.get("daysElapsed", "")
+            parts.append(
+                "<tr>"
+                f"<td style='padding:8px;border:1px solid #dee2e6;'>{r.get('displayName','')}</td>"
+                f"<td style='padding:8px;border:1px solid #dee2e6;font-size:12px;'>{r.get('userEmail','')}</td>"
+                f"<td style='padding:8px;border:1px solid #dee2e6;'>{r.get('offboardDate','')}</td>"
+                f"<td style='padding:8px;border:1px solid #dee2e6;'>{r.get('usageLocation','') or '—'}</td>"
+                f"<td style='padding:8px;border:1px solid #dee2e6;font-size:12px;'>{r.get('managerEmail','') or '—'}</td>"
+                + (f"<td style='padding:8px;border:1px solid #dee2e6;'>{days}</td>" if extra_cols else "")
+                + "</tr>"
+            )
+        return "".join(parts)
+
+    subject = (
+        f"[EF Automation] Daily offboard report – {report_date} "
+        f"(new NO_EF: {len(new_no_ef)}, new EF: {len(new_with_ef)}, overdue NO_EF: {len(overdue_no_ef)})"
+    )
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="UTF-8"></head>
-<body style="font-family:Segoe UI,Arial,sans-serif;color:#333;max-width:640px;margin:auto;padding:20px;">
-  <div style="background:#6c757d;color:#fff;padding:20px;border-radius:6px 6px 0 0;">
-    <h2 style="margin:0;font-size:18px;">No Email Forwarding – Admin Notice</h2>
+<body style="font-family:Segoe UI,Arial,sans-serif;color:#333;max-width:860px;margin:auto;padding:20px;">
+  <div style="background:#243a5e;color:#fff;padding:22px;border-radius:6px 6px 0 0;">
+    <h2 style="margin:0;font-size:20px;">Daily Offboard / EF Monitor Report</h2>
+    <p style="margin:6px 0 0;opacity:.9;font-size:14px;">{report_date} · Netradyne IT Automation</p>
   </div>
-  <div style="background:#f8f9fa;padding:20px;border:1px solid #dee2e6;border-top:none;border-radius:0 0 6px 6px;">
-    <p>{intro}</p>
-    <table style="width:100%;border-collapse:collapse;font-size:14px;">
-      <tr><td style="padding:6px 0;color:#666;">Employee</td><td><strong>{name}</strong> ({email})</td></tr>
-      <tr><td style="padding:6px 0;color:#666;">Offboard date</td><td>{offboard}</td></tr>
-      <tr><td style="padding:6px 0;color:#666;">Region</td><td>{region or '—'}</td></tr>
-      <tr><td style="padding:6px 0;color:#666;">Object ID</td><td style="font-size:12px;">{user_id}</td></tr>
+  <div style="background:#f8f9fa;padding:22px;border:1px solid #dee2e6;border-top:none;border-radius:0 0 6px 6px;">
+    {sp_block}
+
+    <h3 style="margin:8px 0 10px;font-size:15px;">Run summary</h3>
+    <table style="border-collapse:collapse;font-size:13px;margin-bottom:20px;">
+      <tr><td style="padding:4px 12px 4px 0;color:#666;">Checked</td><td><strong>{summary.get('checked', '—')}</strong></td></tr>
+      <tr><td style="padding:4px 12px 4px 0;color:#666;">Alerted (EF)</td><td><strong>{summary.get('alerted', '—')}</strong></td></tr>
+      <tr><td style="padding:4px 12px 4px 0;color:#666;">EF removed</td><td><strong>{summary.get('ef_removed', '—')}</strong></td></tr>
+      <tr><td style="padding:4px 12px 4px 0;color:#666;">Deleted</td><td><strong>{summary.get('deleted', '—')}</strong></td></tr>
+      <tr><td style="padding:4px 12px 4px 0;color:#666;">Errors</td><td><strong>{summary.get('errors', '—')}</strong></td></tr>
     </table>
-    <p style="font-size:13px;color:#666;margin-top:16px;">
-      To exclude an account from automated cleanup deletion, set
-      <code>deletionExempt=true</code> on the UserTracking row or add the user to
-      <strong>DELETION_EXEMPT_USER_IDS</strong> / <strong>DELETION_EXEMPT_EMAILS</strong>
-      in Function App settings.
+
+    <h3 style="margin:18px 0 8px;font-size:15px;">Newly tracked – No email forwarding ({len(new_no_ef)})</h3>
+    <p style="font-size:13px;color:#666;margin-top:0;">IT should delete these during offboarding; monthly cleanup is the safety net.</p>
+    <table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:18px;">
+      <tr style="background:#e9ecef;">
+        <th style="padding:8px;border:1px solid #dee2e6;text-align:left;">Name</th>
+        <th style="padding:8px;border:1px solid #dee2e6;text-align:left;">Email</th>
+        <th style="padding:8px;border:1px solid #dee2e6;text-align:left;">Offboard</th>
+        <th style="padding:8px;border:1px solid #dee2e6;text-align:left;">Region</th>
+        <th style="padding:8px;border:1px solid #dee2e6;text-align:left;">Manager</th>
+      </tr>
+      {_rows(new_no_ef)}
+    </table>
+
+    <h3 style="margin:18px 0 8px;font-size:15px;">Newly tracked – Email forwarding active ({len(new_with_ef)})</h3>
+    <table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:18px;">
+      <tr style="background:#e9ecef;">
+        <th style="padding:8px;border:1px solid #dee2e6;text-align:left;">Name</th>
+        <th style="padding:8px;border:1px solid #dee2e6;text-align:left;">Email</th>
+        <th style="padding:8px;border:1px solid #dee2e6;text-align:left;">Offboard</th>
+        <th style="padding:8px;border:1px solid #dee2e6;text-align:left;">Region</th>
+        <th style="padding:8px;border:1px solid #dee2e6;text-align:left;">Manager</th>
+      </tr>
+      {_rows(new_with_ef)}
+    </table>
+
+    <h3 style="margin:18px 0 8px;font-size:15px;">NO_EF overdue (past reminder day) ({len(overdue_no_ef)})</h3>
+    <table style="width:100%;border-collapse:collapse;font-size:12px;">
+      <tr style="background:#e9ecef;">
+        <th style="padding:8px;border:1px solid #dee2e6;text-align:left;">Name</th>
+        <th style="padding:8px;border:1px solid #dee2e6;text-align:left;">Email</th>
+        <th style="padding:8px;border:1px solid #dee2e6;text-align:left;">Offboard</th>
+        <th style="padding:8px;border:1px solid #dee2e6;text-align:left;">Region</th>
+        <th style="padding:8px;border:1px solid #dee2e6;text-align:left;">Manager</th>
+        <th style="padding:8px;border:1px solid #dee2e6;text-align:left;">Days</th>
+      </tr>
+      {_rows(overdue_no_ef, extra_cols=True)}
+    </table>
+
+    <p style="font-size:12px;color:#888;border-top:1px solid #dee2e6;padding-top:14px;margin-top:24px;">
+      Recipients controlled by <strong>REPORT_EMAILS</strong> (fallback: ADMIN_EMAILS).<br>
+      Operational state remains in Azure Table Storage (UserTracking / AuditLog / EmailLog).
     </p>
   </div>
 </body>
 </html>"""
 
     sent = 0
-    for admin in admins:
-        if _send(admin, subject, html):
+    for addr in recipients:
+        if _send(addr, subject, html):
             sent += 1
     return sent
+
+
+def send_no_ef_admin_notice(*args: Any, **kwargs: Any) -> int:
+    """Deprecated – use send_offboard_consolidated_report. Kept for import compatibility."""
+    logger.warning("send_no_ef_admin_notice is deprecated; consolidated report is used instead")
+    return 0
 
 
 def send_final_deletion_notice(record: Dict[str, Any]) -> bool:

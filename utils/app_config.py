@@ -30,6 +30,29 @@ def get_admin_emails() -> List[str]:
     ]
 
 
+def get_report_emails() -> List[str]:
+    """
+    Recipients for the daily consolidated offboard report.
+
+    Prefer REPORT_EMAILS (team mailbox). Falls back to ADMIN_EMAILS.
+    Change REPORT_EMAILS in App Settings without code changes.
+    """
+    report = [
+        e.strip()
+        for e in os.environ.get("REPORT_EMAILS", "").split(",")
+        if e.strip()
+    ]
+    return report or get_admin_emails()
+
+
+def get_sharepoint_report_url() -> str:
+    """Optional SharePoint folder/file link shown in the consolidated report email."""
+    return (
+        os.environ.get("SHAREPOINT_REPORT_URL", "").strip()
+        or os.environ.get("SHAREPOINT_REPORT_FOLDER_URL", "").strip()
+    )
+
+
 def get_deletion_exempt_user_ids() -> frozenset:
     raw = os.environ.get("DELETION_EXEMPT_USER_IDS", "")
     return frozenset(x.strip().lower() for x in raw.split(",") if x.strip())
