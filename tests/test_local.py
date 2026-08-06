@@ -562,6 +562,17 @@ class TestDeletionExemptAndDryRun:
         from utils.app_config import get_servicedesk_ticket_url
         assert get_servicedesk_ticket_url() == "https://sd.example/primary"
 
+    def test_sharepoint_url_built_from_site_library_folder(self, monkeypatch):
+        monkeypatch.delenv("SHAREPOINT_REPORT_URL", raising=False)
+        monkeypatch.setenv("SHAREPOINT_SITE_URL", "https://netorg726775.sharepoint.com/sites/ITTEAM259")
+        monkeypatch.setenv("SHAREPOINT_LIBRARY", "Shared Documents")
+        monkeypatch.setenv("SHAREPOINT_FOLDER", "General/Jagruth/Automation_Reports/EF")
+        from utils.app_config import get_sharepoint_report_url
+        url = get_sharepoint_report_url()
+        assert url.startswith("https://netorg726775.sharepoint.com/sites/ITTEAM259/")
+        assert "Shared%20Documents" in url
+        assert "Automation_Reports" in url
+
     def test_consolidated_report_uses_report_emails_and_sharepoint(self, monkeypatch):
         monkeypatch.setenv("REPORT_EMAILS", "prem_testing@netradyne.com")
         monkeypatch.setenv("SHAREPOINT_REPORT_URL", "https://contoso.sharepoint.com/sites/IT/Reports")
@@ -579,15 +590,24 @@ class TestDeletionExemptAndDryRun:
                     "offboardDate": "2026-07-01", "usageLocation": "IN",
                     "managerEmail": "m@x.com",
                 }],
-                new_with_ef=[],
+                new_with_ef=[{
+                    "displayName": "B", "userEmail": "b@x.com",
+                    "offboardDate": "2026-07-02", "usageLocation": "IN",
+                    "managerEmail": "mgr@x.com",
+                    "forwardingAddress": "fwd@x.com",
+                }],
                 overdue_no_ef=[],
-                summary={"checked": 1},
+                summary={"alerts": 1},
+                period_label="Weekly",
+                period_start="2026-07-29",
             )
         assert n == 1
         html = mock_send.call_args.kwargs["html_body"]
         assert "https://contoso.sharepoint.com/sites/IT/Reports" in html
         assert "Open report folder in SharePoint" in html
-        assert "Daily Offboard" in mock_send.call_args.kwargs["subject"] or "offboard report" in mock_send.call_args.kwargs["subject"].lower()
+        assert "fwd@x.com" in html
+        assert "mgr@x.com" in html
+        assert "Weekly" in mock_send.call_args.kwargs["subject"]
 
     def test_ooo_is_internal_only(self):
         with patch("utils.graph_api._patch", return_value=True) as mock_patch:

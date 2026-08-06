@@ -22,9 +22,6 @@ from typing import Any, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-_APPROVAL_TOKEN_DAYS = int(os.environ.get("APPROVAL_TOKEN_DAYS", "7"))
-_FUNC_BASE_URL = os.environ.get("FUNC_BASE_URL", "").rstrip("/")
-
 # Mapping from extension_count → CSA value offered in the approval button
 _EXT_TYPE_MAP = {
     0: "EXTEND_TO_30",
@@ -41,10 +38,11 @@ def generate_approval_urls(user_id: str, ext_count: int) -> Tuple[str, str, str]
     """
     from .table_store import TableStore
 
+    token_days = int(os.environ.get("APPROVAL_TOKEN_DAYS", "7"))
     ext_type = _EXT_TYPE_MAP.get(ext_count, "EXTEND_TO_30")
     token = uuid.uuid4().hex  # 32-char hex token
 
-    expires_at = (datetime.now(timezone.utc) + timedelta(days=_APPROVAL_TOKEN_DAYS)).isoformat()
+    expires_at = (datetime.now(timezone.utc) + timedelta(days=token_days)).isoformat()
 
     store = TableStore()
     store.store_approval_token({
@@ -56,7 +54,7 @@ def generate_approval_urls(user_id: str, ext_count: int) -> Tuple[str, str, str]
         "createdAt": datetime.now(timezone.utc).isoformat(),
     })
 
-    base = _FUNC_BASE_URL
+    base = os.environ.get("FUNC_BASE_URL", "").rstrip("/")
     approve_url = f"{base}/api/ef_approval?token={token}&action=approve"
     decline_url = f"{base}/api/ef_approval?token={token}&action=decline"
     logger.info("Generated approval token for userId=%s extType=%s expires=%s", user_id, ext_type, expires_at)

@@ -53,10 +53,9 @@ os.environ.setdefault(
     os.environ.get("SDP_TICKET_URL", "https://itservicedesk.netradyne.com/"),
 )
 # Demo SharePoint link until real folder URL is provided
-os.environ.setdefault(
-    "SHAREPOINT_REPORT_URL",
-    "https://netradyne.sharepoint.com/sites/IT/Shared%20Documents/EF-Automation-Reports",
-)
+os.environ.setdefault("SHAREPOINT_SITE_URL", "https://netorg726775.sharepoint.com/sites/ITTEAM259")
+os.environ.setdefault("SHAREPOINT_LIBRARY", "Shared Documents")
+os.environ.setdefault("SHAREPOINT_FOLDER", "General/Jagruth/Automation_Reports/EF")
 os.environ["EF_DRY_RUN"] = "false"
 os.environ["DISABLE_OUTBOUND_EMAIL"] = "false"
 
@@ -155,6 +154,8 @@ def _send_one(name: str) -> bool:
     elif name == "it_approval":
         ok = send_it_approval_notification(
             _record(),
+            # Sample links only — real alerts use a one-time token from ApprovalTokens.
+            # After deploy (ANONYMOUS auth), dummy token shows "invalid/expired", not HTTP 401.
             approve_url="https://func-ef-forwarding.azurewebsites.net/api/ef_approval?token=test&action=approve",
             decline_url="https://func-ef-forwarding.azurewebsites.net/api/ef_approval?token=test&action=decline",
             ext_type="EXTEND_TO_30",
@@ -183,6 +184,7 @@ def _send_one(name: str) -> bool:
                 "offboardDate": (_today - timedelta(days=20)).isoformat(),
                 "usageLocation": "IN",
                 "managerEmail": TEST_RECIPIENT,
+                "forwardingAddress": "manager.fwd@netradyne.com",
             }
         ]
         sample_overdue = [
@@ -200,7 +202,9 @@ def _send_one(name: str) -> bool:
             new_no_ef=sample_no_ef,
             new_with_ef=sample_ef,
             overdue_no_ef=sample_overdue,
-            summary={"checked": 191, "alerted": 1, "ef_removed": 0, "deleted": 0, "errors": 0},
+            summary={"alerts": 1, "extensions": 0, "deletions": 0, "total_active": 140},
+            period_label="Weekly",
+            period_start=(_today - timedelta(days=7)).isoformat(),
         ) > 0
     else:
         print("unknown")

@@ -100,9 +100,6 @@ def send_ef_alert(record: Dict[str, Any], days_remaining: int, is_final: bool = 
     employee_mail = record.get("userEmail", "")
     offboard_date = record.get("offboardDate", "")
     delete_date   = record.get("deleteDate", "")
-    ext_count     = int(record.get("extensionCount", 0))
-    max_ext       = 2
-    exts_left     = max_ext - ext_count
 
     if is_final:
         urgency_banner = (
@@ -167,13 +164,9 @@ def send_ef_alert(record: Dict[str, Any], days_remaining: int, is_final: bool = 
         <td style="padding:10px 14px;font-weight:bold;border:1px solid #dee2e6;color:#dc3545;">Forwarding Expires</td>
         <td style="padding:10px 14px;border:1px solid #dee2e6;font-weight:bold;color:#dc3545;">{delete_date}</td>
       </tr>
-      <tr style="background:#e9ecef;">
-        <td style="padding:10px 14px;font-weight:bold;border:1px solid #dee2e6;">Extensions Used</td>
-        <td style="padding:10px 14px;border:1px solid #dee2e6;">{ext_count} of {max_ext} ({exts_left} remaining)</td>
-      </tr>
     </table>
 
-    {'<p><strong>No further extensions are available. The account will be permanently deleted on the date shown above.</strong></p>' if is_final else f'''
+    {'<p><strong>No further extensions are available. The account will be deleted on the date shown above.</strong></p>' if is_final else f'''
     <div style="background:#d1ecf1;border:1px solid #bee5eb;padding:16px;border-radius:4px;margin:20px 0;">
       <h3 style="margin:0 0 10px;color:#0c5460;">&#x2192; To request a 30-day extension:</h3>
       <ol style="margin:0;padding-left:20px;line-height:1.7;">
@@ -263,7 +256,7 @@ def send_ef_removed_notice(record: Dict[str, Any], days_until_delete: int, reaso
     <div style="background:#fff3cd;border:1px solid #ffc107;padding:16px;border-radius:4px;margin:20px 0;">
       <strong>&#9200; Account Deletion in {days_until_delete} day{"s" if days_until_delete != 1 else ""}
       (on {delete_date})</strong><br>
-      The Azure AD account will be permanently deleted on this date unless an extension is approved.
+      The Azure AD account will be deleted on this date unless an extension is approved.
     </div>
 
     <table style="width:100%;border-collapse:collapse;margin:16px 0;font-size:13px;">
@@ -343,13 +336,9 @@ def send_extension_confirm(record: Dict[str, Any]) -> bool:
         <td style="padding:10px 14px;font-weight:bold;border:1px solid #dee2e6;color:#28a745;">New Expiry Date</td>
         <td style="padding:10px 14px;border:1px solid #dee2e6;font-weight:bold;color:#28a745;">{new_delete}</td>
       </tr>
-      <tr style="background:#e9ecef;">
-        <td style="padding:10px 14px;font-weight:bold;border:1px solid #dee2e6;">Extensions Used</td>
-        <td style="padding:10px 14px;border:1px solid #dee2e6;">{ext_count} of {max_ext}</td>
-      </tr>
     </table>
 
-    {'<p style="color:#dc3545;font-weight:bold;">This was the final extension. The account will be permanently deleted on the new expiry date. No further extensions can be granted.</p>' if ext_count >= max_ext else ''}
+    {'<p style="color:#dc3545;font-weight:bold;">This was the final extension. The account will be deleted on the new expiry date. No further extensions can be granted.</p>' if ext_count >= max_ext else ''}
 
     <p style="font-size:13px;color:#888;border-top:1px solid #dee2e6;padding-top:16px;margin-top:24px;">
       This is an automated confirmation from IT Operations.<br>
@@ -362,9 +351,59 @@ def send_extension_confirm(record: Dict[str, Any]) -> bool:
     return _send(manager_email, subject, html, cc_address=it_email)
 
 
+def _send_admin_soft_delete_notice(
+    record: Dict[str, Any],
+    *,
+    reason: str,
+    max_policy: bool = False,
+) -> int:
+    """Admin-only notice: deletion is Entra soft-delete (recycle bin ~30 days)."""
+    recipients = get_admin_emails()
+    it_email = os.environ.get("IT_EMAIL", "").strip()
+    if it_email and it_email not in recipients:
+        recipients = list(recipients) + [it_email]
+    if not recipients:
+        return 0
+
+    employee_name = record.get("displayName", "the terminated employee")
+    employee_mail = record.get("userEmail", "")
+    user_id = record.get("userId", "")
+    deleted_date = datetime.now(timezone.utc).strftime("%B %d, %Y")
+    recovery_days = int(os.environ.get("RECOVERY_GRACE_DAYS", "30"))
+    policy = "max policy (90 days)" if max_policy else reason
+
+    subject = f"[EF Admin] Soft-delete completed – {employee_name}"
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"></head>
+<body style="font-family:Segoe UI,Arial,sans-serif;color:#333;max-width:640px;margin:auto;padding:20px;">
+  <div style="background:#243a5e;color:#fff;padding:20px;border-radius:6px 6px 0 0;">
+    <h2 style="margin:0;font-size:18px;">Admin notice – Soft delete (not permanent)</h2>
+  </div>
+  <div style="background:#f8f9fa;padding:20px;border:1px solid #dee2e6;border-top:none;border-radius:0 0 6px 6px;">
+    <p><strong>{employee_name}</strong> ({employee_mail}) was <strong>soft-deleted</strong>
+    on {deleted_date}.</p>
+    <ul>
+      <li>Graph action: Entra recycle bin (soft delete) — <em>not</em> a hard/permanent delete</li>
+      <li>Microsoft auto-purges the recycle bin after ~{recovery_days} days</li>
+      <li>Reason / path: {policy}</li>
+      <li>User ID: {user_id or '—'}</li>
+    </ul>
+    <p style="font-size:13px;color:#666;">Managers receive a plain “account deleted” notice without this detail.</p>
+  </div>
+</body>
+</html>"""
+    sent = 0
+    for addr in recipients:
+        if _send(addr, subject, html):
+            sent += 1
+    return sent
+
+
 def send_deletion_notice(record: Dict[str, Any], reason: str) -> bool:
     """
-    Notification sent after an account is deleted (Day 30 / 60 paths).
+    Manager notification after account deletion (Day 30 / 60 paths).
+    Managers see plain “deleted” wording; admins get soft-delete detail separately.
 
     reason values: 'NO_EF', 'NO_EXTENSION_DAY30', 'NO_EXTENSION_DAY60'
     """
@@ -409,14 +448,9 @@ def send_deletion_notice(record: Dict[str, Any], reason: str) -> bool:
 
     <p>Reason: {reason_text}</p>
 
-    <div style="background:#fff3cd;border:1px solid #ffeeba;padding:16px;border-radius:4px;margin:20px 0;">
-      <h4 style="margin:0 0 8px;color:#856404;">&#128274; Account Recovery (if needed)</h4>
-      <p style="margin:0;">If this account is required for business purposes, it <strong>can be recovered
-      within 30 days</strong> of deletion. Note that email forwarding will be <u>permanently disabled</u>
-      upon recovery.</p>
-      <p style="margin:8px 0 0;">To request recovery, email <a href="mailto:{it_email}">{it_email}</a>
-      with subject: <em>Account Recovery – {employee_name}</em></p>
-    </div>
+    <p>If this account is still required for business purposes, contact
+    <a href="mailto:{it_email}">{it_email}</a> with subject:
+    <em>Account Recovery – {employee_name}</em>.</p>
 
     <p style="font-size:13px;color:#888;border-top:1px solid #dee2e6;padding-top:16px;margin-top:24px;">
       This is an automated message from IT Operations.
@@ -425,7 +459,9 @@ def send_deletion_notice(record: Dict[str, Any], reason: str) -> bool:
 </body>
 </html>"""
 
-    return _send(manager_email, subject, html, cc_address=it_email)
+    ok = _send(manager_email, subject, html)
+    _send_admin_soft_delete_notice(record, reason=reason, max_policy=False)
+    return ok
 
 
 def send_weekly_report(data: Dict[str, Any], admin_emails: List[str]) -> int:
@@ -483,9 +519,7 @@ def send_weekly_report(data: Dict[str, Any], admin_emails: List[str]) -> int:
                 '<td style="padding:8px 14px;border:1px solid #dee2e6;">' + u["name"] + '</td>'
                 '<td style="padding:8px 14px;border:1px solid #dee2e6;">' + u["email"] + '</td>'
                 '<td style="padding:8px 14px;border:1px solid #dee2e6;' + deadline_style + '">'
-                + u["deleteDate"] + ' (' + str(u["daysLeft"]) + 'd)</td>'
-                '<td style="padding:8px 14px;border:1px solid #dee2e6;text-align:center;">'
-                + str(u["extCount"]) + '/2</td></tr>'
+                + u["deleteDate"] + ' (' + str(u["daysLeft"]) + 'd)</td></tr>'
             )
         upcoming_rows = "".join(upcoming_row_parts)
         upcoming_section = (
@@ -496,7 +530,6 @@ def send_weekly_report(data: Dict[str, Any], admin_emails: List[str]) -> int:
             '<th style="padding:8px 14px;text-align:left;">Employee</th>'
             '<th style="padding:8px 14px;text-align:left;">Email</th>'
             '<th style="padding:8px 14px;text-align:left;">Deadline</th>'
-            '<th style="padding:8px 14px;text-align:center;">Extensions</th>'
             '</tr>' + upcoming_rows + '</table>'
         )
     else:
@@ -712,7 +745,8 @@ def send_it_approval_notification(
 
     <p style="font-size:12px;color:#888;border-top:1px solid #dee2e6;padding-top:14px;margin-top:24px;">
       Clicking Approve opens a confirmation page where you can enter the SD+ ticket number.<br>
-      Clicking Decline logs the refusal — the account will be deleted on schedule.
+      Clicking Decline logs the refusal — the account will be <strong>soft-deleted</strong>
+      on schedule (Entra recycle bin; Microsoft purges after ~30 days). This is not a hard delete.
     </p>
   </div>
 </body>
@@ -728,13 +762,14 @@ def send_offboard_consolidated_report(
     new_with_ef: List[Dict[str, Any]],
     overdue_no_ef: List[Dict[str, Any]],
     summary: Optional[Dict[str, Any]] = None,
+    period_label: str = "Weekly",
+    period_start: str = "",
 ) -> int:
     """
-    One consolidated daily report for IT / team mailbox (REPORT_EMAILS).
+    Consolidated weekly/monthly report for IT / team mailbox (REPORT_EMAILS).
 
-    Replaces per-user NO_EF admin notices.  Optional SHAREPOINT_REPORT_URL is
-    hyperlinked in the email when configured.
-    Returns number of successful recipient sends.
+    SharePoint folder link is hyperlinked when configured.
+    Newly tracked EF rows include forwarding target + manager.
     """
     recipients = get_report_emails()
     if not recipients:
@@ -756,16 +791,16 @@ def send_offboard_consolidated_report(
     else:
         sp_block = (
             '<p style="font-size:12px;color:#888;margin:12px 0;">'
-            'SharePoint archive link not configured yet '
-            '(set <code>SHAREPOINT_REPORT_URL</code> in App Settings).</p>'
+            'SharePoint archive link not configured '
+            '(set SHAREPOINT_SITE_URL / LIBRARY / FOLDER).</p>'
         )
 
-    def _rows(records: List[Dict[str, Any]], extra_cols: bool = False) -> str:
+    def _rows_no_ef(records: List[Dict[str, Any]], with_days: bool = False) -> str:
+        cols = 6 if with_days else 5
         if not records:
-            return '<tr><td colspan="5" style="padding:10px;color:#666;">None</td></tr>'
+            return f'<tr><td colspan="{cols}" style="padding:10px;color:#666;">None</td></tr>'
         parts = []
         for r in records:
-            days = r.get("daysElapsed", "")
             parts.append(
                 "<tr>"
                 f"<td style='padding:8px;border:1px solid #dee2e6;'>{r.get('displayName','')}</td>"
@@ -773,34 +808,55 @@ def send_offboard_consolidated_report(
                 f"<td style='padding:8px;border:1px solid #dee2e6;'>{r.get('offboardDate','')}</td>"
                 f"<td style='padding:8px;border:1px solid #dee2e6;'>{r.get('usageLocation','') or '—'}</td>"
                 f"<td style='padding:8px;border:1px solid #dee2e6;font-size:12px;'>{r.get('managerEmail','') or '—'}</td>"
-                + (f"<td style='padding:8px;border:1px solid #dee2e6;'>{days}</td>" if extra_cols else "")
+                + (f"<td style='padding:8px;border:1px solid #dee2e6;'>{r.get('daysElapsed','')}</td>" if with_days else "")
                 + "</tr>"
             )
         return "".join(parts)
 
+    def _rows_ef(records: List[Dict[str, Any]]) -> str:
+        if not records:
+            return '<tr><td colspan="6" style="padding:10px;color:#666;">None</td></tr>'
+        parts = []
+        for r in records:
+            parts.append(
+                "<tr>"
+                f"<td style='padding:8px;border:1px solid #dee2e6;'>{r.get('displayName','')}</td>"
+                f"<td style='padding:8px;border:1px solid #dee2e6;font-size:12px;'>{r.get('userEmail','')}</td>"
+                f"<td style='padding:8px;border:1px solid #dee2e6;'>{r.get('offboardDate','')}</td>"
+                f"<td style='padding:8px;border:1px solid #dee2e6;font-size:12px;'>"
+                f"{r.get('forwardingAddress','') or '—'}</td>"
+                f"<td style='padding:8px;border:1px solid #dee2e6;font-size:12px;'>"
+                f"{r.get('managerEmail','') or '—'}</td>"
+                f"<td style='padding:8px;border:1px solid #dee2e6;'>{r.get('usageLocation','') or '—'}</td>"
+                "</tr>"
+            )
+        return "".join(parts)
+
+    period_line = f"{period_start} → {report_date}" if period_start else report_date
     subject = (
-        f"[EF Automation] Daily offboard report – {report_date} "
+        f"[EF Automation] {period_label} offboard report – {report_date} "
         f"(new NO_EF: {len(new_no_ef)}, new EF: {len(new_with_ef)}, overdue NO_EF: {len(overdue_no_ef)})"
     )
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="UTF-8"></head>
-<body style="font-family:Segoe UI,Arial,sans-serif;color:#333;max-width:860px;margin:auto;padding:20px;">
+<body style="font-family:Segoe UI,Arial,sans-serif;color:#333;max-width:920px;margin:auto;padding:20px;">
   <div style="background:#243a5e;color:#fff;padding:22px;border-radius:6px 6px 0 0;">
-    <h2 style="margin:0;font-size:20px;">Daily Offboard / EF Monitor Report</h2>
-    <p style="margin:6px 0 0;opacity:.9;font-size:14px;">{report_date} · Netradyne IT Automation</p>
+    <h2 style="margin:0;font-size:20px;">{period_label} Offboard / EF Monitor Report</h2>
+    <p style="margin:6px 0 0;opacity:.9;font-size:14px;">{period_line} · Netradyne IT Automation</p>
   </div>
   <div style="background:#f8f9fa;padding:22px;border:1px solid #dee2e6;border-top:none;border-radius:0 0 6px 6px;">
     {sp_block}
 
-    <h3 style="margin:8px 0 10px;font-size:15px;">Run summary</h3>
+    <h3 style="margin:8px 0 10px;font-size:15px;">Period activity summary</h3>
     <table style="border-collapse:collapse;font-size:13px;margin-bottom:20px;">
-      <tr><td style="padding:4px 12px 4px 0;color:#666;">Checked</td><td><strong>{summary.get('checked', '—')}</strong></td></tr>
-      <tr><td style="padding:4px 12px 4px 0;color:#666;">Alerted (EF)</td><td><strong>{summary.get('alerted', '—')}</strong></td></tr>
-      <tr><td style="padding:4px 12px 4px 0;color:#666;">EF removed</td><td><strong>{summary.get('ef_removed', '—')}</strong></td></tr>
-      <tr><td style="padding:4px 12px 4px 0;color:#666;">Deleted</td><td><strong>{summary.get('deleted', '—')}</strong></td></tr>
-      <tr><td style="padding:4px 12px 4px 0;color:#666;">Errors</td><td><strong>{summary.get('errors', '—')}</strong></td></tr>
+      <tr><td style="padding:4px 12px 4px 0;color:#666;">Registrations (NO_EF)</td><td><strong>{len(new_no_ef)}</strong></td></tr>
+      <tr><td style="padding:4px 12px 4px 0;color:#666;">Registrations (EF)</td><td><strong>{len(new_with_ef)}</strong></td></tr>
+      <tr><td style="padding:4px 12px 4px 0;color:#666;">Alerts</td><td><strong>{summary.get('alerts', summary.get('alerted', '—'))}</strong></td></tr>
+      <tr><td style="padding:4px 12px 4px 0;color:#666;">Extensions</td><td><strong>{summary.get('extensions', '—')}</strong></td></tr>
+      <tr><td style="padding:4px 12px 4px 0;color:#666;">Deletions</td><td><strong>{summary.get('deletions', summary.get('deleted', '—'))}</strong></td></tr>
+      <tr><td style="padding:4px 12px 4px 0;color:#666;">Active tracked</td><td><strong>{summary.get('total_active', '—')}</strong></td></tr>
     </table>
 
     <h3 style="margin:18px 0 8px;font-size:15px;">Newly tracked – No email forwarding ({len(new_no_ef)})</h3>
@@ -813,7 +869,7 @@ def send_offboard_consolidated_report(
         <th style="padding:8px;border:1px solid #dee2e6;text-align:left;">Region</th>
         <th style="padding:8px;border:1px solid #dee2e6;text-align:left;">Manager</th>
       </tr>
-      {_rows(new_no_ef)}
+      {_rows_no_ef(new_no_ef)}
     </table>
 
     <h3 style="margin:18px 0 8px;font-size:15px;">Newly tracked – Email forwarding active ({len(new_with_ef)})</h3>
@@ -822,10 +878,11 @@ def send_offboard_consolidated_report(
         <th style="padding:8px;border:1px solid #dee2e6;text-align:left;">Name</th>
         <th style="padding:8px;border:1px solid #dee2e6;text-align:left;">Email</th>
         <th style="padding:8px;border:1px solid #dee2e6;text-align:left;">Offboard</th>
-        <th style="padding:8px;border:1px solid #dee2e6;text-align:left;">Region</th>
+        <th style="padding:8px;border:1px solid #dee2e6;text-align:left;">Forwarding to</th>
         <th style="padding:8px;border:1px solid #dee2e6;text-align:left;">Manager</th>
+        <th style="padding:8px;border:1px solid #dee2e6;text-align:left;">Region</th>
       </tr>
-      {_rows(new_with_ef)}
+      {_rows_ef(new_with_ef)}
     </table>
 
     <h3 style="margin:18px 0 8px;font-size:15px;">NO_EF overdue (past reminder day) ({len(overdue_no_ef)})</h3>
@@ -838,12 +895,14 @@ def send_offboard_consolidated_report(
         <th style="padding:8px;border:1px solid #dee2e6;text-align:left;">Manager</th>
         <th style="padding:8px;border:1px solid #dee2e6;text-align:left;">Days</th>
       </tr>
-      {_rows(overdue_no_ef, extra_cols=True)}
+      {_rows_no_ef(overdue_no_ef, with_days=True)}
     </table>
 
     <p style="font-size:12px;color:#888;border-top:1px solid #dee2e6;padding-top:14px;margin-top:24px;">
-      Recipients controlled by <strong>REPORT_EMAILS</strong> (fallback: ADMIN_EMAILS).<br>
-      Operational state remains in Azure Table Storage (UserTracking / AuditLog / EmailLog).
+      Recipients: <strong>REPORT_EMAILS</strong> (fallback ADMIN_EMAILS).<br>
+      Deletions by this automation are <strong>soft-delete</strong> (Entra recycle bin; Microsoft
+      purges after ~30 days) — not hard/permanent delete.<br>
+      Operational state remains in Azure Table Storage.
     </p>
   </div>
 </body>
@@ -864,8 +923,8 @@ def send_no_ef_admin_notice(*args: Any, **kwargs: Any) -> int:
 
 def send_final_deletion_notice(record: Dict[str, Any]) -> bool:
     """
-    Final notification for Day 90 max-policy deletion.
-    Explicitly states no further extensions are possible.
+    Manager notice for Day 90 max-policy deletion (plain “deleted” wording).
+    Admins get soft-delete technical detail in a separate email.
     """
     manager_email = record.get("managerEmail", "")
     if not manager_email:
@@ -875,7 +934,6 @@ def send_final_deletion_notice(record: Dict[str, Any]) -> bool:
     employee_name = record.get("displayName", "the terminated employee")
     employee_mail = record.get("userEmail", "")
     deleted_date  = datetime.now(timezone.utc).strftime("%B %d, %Y")
-    recovery_days = int(os.environ.get("RECOVERY_GRACE_DAYS", "30"))
 
     subject = f"Account Deleted (Max Policy) – {employee_name} – {deleted_date}"
 
@@ -885,7 +943,7 @@ def send_final_deletion_notice(record: Dict[str, Any]) -> bool:
 <body style="font-family:Segoe UI,Arial,sans-serif;color:#333;max-width:640px;margin:auto;padding:20px;">
 
   <div style="background:#dc3545;color:#fff;padding:24px;border-radius:6px 6px 0 0;">
-    <h2 style="margin:0;font-size:20px;">Account Permanently Deleted – Max Policy Reached</h2>
+    <h2 style="margin:0;font-size:20px;">Account Deleted – Max Policy Reached</h2>
     <p style="margin:6px 0 0;opacity:.85;font-size:14px;">Netradyne IT Operations</p>
   </div>
 
@@ -893,35 +951,23 @@ def send_final_deletion_notice(record: Dict[str, Any]) -> bool:
     <p>Dear Manager,</p>
 
     <p>The Azure AD account for <strong>{employee_name}</strong> ({employee_mail}) has been
-    <strong>permanently deleted</strong> on <strong>{deleted_date}</strong> as per the company's
+    <strong>deleted</strong> on <strong>{deleted_date}</strong> as per the company's
     maximum email forwarding policy of <strong>90 days</strong>.</p>
 
-    <p>All email forwarding for this account has ceased.  No further extensions can be granted.</p>
+    <p>All email forwarding has ceased. No further extensions can be granted.</p>
 
-    <div style="background:#fff3cd;border:1px solid #ffeeba;padding:16px;border-radius:4px;margin:20px 0;">
-      <h4 style="margin:0 0 8px;color:#856404;">&#128274; Account Recovery (for other business purposes only)</h4>
-      <p style="margin:0;">
-        If this account is needed for <u>reasons other than email forwarding</u> (e.g., accessing
-        mailbox archive, SharePoint permissions), it can be restored within <strong>{recovery_days} days</strong>
-        of this notice.
-      </p>
-      <ul style="margin:8px 0 0;padding-left:20px;">
-        <li>Email forwarding will be <strong>permanently disabled</strong> on recovery</li>
-        <li>Mailbox access may be limited to read-only archive</li>
-        <li>Recovery must be approved by IT Director</li>
-      </ul>
-      <p style="margin:8px 0 0;">
-        To request recovery, email <a href="mailto:{it_email}">{it_email}</a> with subject:<br>
-        <em>Account Recovery Request – {employee_name}</em>
-      </p>
-    </div>
+    <p>If this account is still required for business purposes (other than email forwarding),
+    contact <a href="mailto:{it_email}">{it_email}</a> with subject:
+    <em>Account Recovery Request – {employee_name}</em>.</p>
 
     <p style="font-size:13px;color:#888;border-top:1px solid #dee2e6;padding-top:16px;margin-top:24px;">
-      This is an automated message from IT Operations. Reference: MAX_POLICY_DAY90<br>
+      This is an automated message from IT Operations.<br>
       Questions? Contact <a href="mailto:{it_email}">{it_email}</a>
     </p>
   </div>
 </body>
 </html>"""
 
-    return _send(manager_email, subject, html, cc_address=it_email)
+    ok = _send(manager_email, subject, html)
+    _send_admin_soft_delete_notice(record, reason="MAX_POLICY_DAY90", max_policy=True)
+    return ok

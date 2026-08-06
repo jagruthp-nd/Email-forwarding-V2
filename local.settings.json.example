@@ -35,6 +35,9 @@
     "EF_TEST_RECIPIENT":       "prem_testing@netradyne.com",
 
     "REPORT_EMAILS":             "prem_testing@netradyne.com",
+    "SHAREPOINT_SITE_URL":       "https://netorg726775.sharepoint.com/sites/ITTEAM259",
+    "SHAREPOINT_LIBRARY":        "Shared Documents",
+    "SHAREPOINT_FOLDER":         "General/Jagruth/Automation_Reports/EF",
     "SHAREPOINT_REPORT_URL":     "",
 
     "NO_EF_ADMIN_REMINDER_DAY": "28",
@@ -51,7 +54,8 @@
     "FUNC_BASE_URL":            "<https://your-function-app.azurewebsites.net>",
 
     "ADMIN_EMAILS":              "<comma-separated admin emails, e.g. admin1@domain.com,admin2@domain.com>",
-    "WEEKLY_REPORT_SCHEDULE":    "0 30 8 * * 5",
+    "WEEKLY_REPORT_SCHEDULE":    "0 30 8 * * 1",
+    "MONTHLY_REPORT_SCHEDULE":   "0 30 7 1 * *",
 
     "CLEANUP_SCHEDULE":          "0 0 6 1 * *",
     "CLEANUP_REGION":            "IN",

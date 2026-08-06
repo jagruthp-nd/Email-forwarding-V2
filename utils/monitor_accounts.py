@@ -76,7 +76,6 @@ from .email_sender import (
     send_deletion_notice,
     send_final_deletion_notice,
     send_it_approval_notification,
-    send_offboard_consolidated_report,
 )
 from .approval_webhook import generate_approval_urls
 from .automation_flags import is_dry_run, log_active_gates, resolve_ooo_contact
@@ -167,10 +166,8 @@ def run_monitor() -> Dict[str, int]:
 
     summary: Dict[str, int] = {
         "checked": 0, "alerted": 0, "ef_removed": 0, "deleted": 0,
-        "errors": 0, "skipped": 0, "dry_run": 0, "report_sent": 0,
+        "errors": 0, "skipped": 0, "dry_run": 0,
     }
-    # Accumulator for one consolidated IT report (no per-user admin emails)
-    report_ctx: Dict[str, Any] = {"new_no_ef": [], "new_with_ef": []}
 
     for user in ad_users:
         user_id = user.get("id", "")
@@ -179,7 +176,8 @@ def run_monitor() -> Dict[str, int]:
 
         try:
             summary["checked"] += 1
-            action = _process_user(user, today, store, tracked.get(user_id), report_ctx)
+            # report_ctx unused daily – weekly/monthly reports read AuditLog REGISTERED
+            action = _process_user(user, today, store, tracked.get(user_id), None)
             if action == "alerted":
                 summary["alerted"] += 1
             elif action == "ef_removed":
@@ -194,35 +192,11 @@ def run_monitor() -> Dict[str, int]:
             summary["errors"] += 1
             logger.error("Unhandled error for userId=%s: %s", user_id, exc, exc_info=True)
 
-    overdue = _collect_overdue_no_ef(store, today)
-    try:
-        sent = send_offboard_consolidated_report(
-            report_date=today.isoformat(),
-            new_no_ef=report_ctx["new_no_ef"],
-            new_with_ef=report_ctx["new_with_ef"],
-            overdue_no_ef=overdue,
-            summary=summary,
-        )
-        summary["report_sent"] = sent
-        if sent:
-            store.append_email_log(
-                user_id="DAILY_REPORT",
-                email_type="OFFBOARD_REPORT",
-                recipient="REPORT_EMAILS",
-                subject=f"Daily offboard report – {today.isoformat()}",
-                status="SENT",
-            )
-    except Exception as exc:
-        summary["errors"] += 1
-        logger.error("Consolidated offboard report failed: %s", exc, exc_info=True)
-
     logger.info(
         "=== EF Monitor complete – checked=%d alerted=%d ef_removed=%d deleted=%d "
-        "errors=%d skipped=%d report_sent=%d new_no_ef=%d new_ef=%d overdue_no_ef=%d ===",
+        "errors=%d skipped=%d (consolidated report is weekly Mon + monthly) ===",
         summary["checked"], summary["alerted"], summary["ef_removed"],
         summary["deleted"], summary["errors"], summary["skipped"],
-        summary["report_sent"],
-        len(report_ctx["new_no_ef"]), len(report_ctx["new_with_ef"]), len(overdue),
     )
     return summary
 
@@ -324,7 +298,7 @@ def _process_user(
     #   India policy: IT deletes NO_EF accounts manually during offboarding.
     #   The monthly cleanup scan (cleanup_scan.py) is the automated safety net.
     #   Set AUTO_DELETE_NO_EF=true to revert to immediate auto-delete behaviour.
-    #   Admin notice is via daily consolidated report (not per-user email).
+    #   Admin notice is via weekly/monthly consolidated report (not per-user email).
     if not ef_required:
         if _AUTO_DELETE_NO_EF and days_elapsed >= _EF_REMOVE_1:
             return _do_delete(user_id, record, "NO_EF", store)
@@ -837,6 +811,7 @@ def _create_record(
             "offboardDate": record.get("offboardDate", ""),
             "usageLocation": record.get("usageLocation", ""),
             "managerEmail": record.get("managerEmail", ""),
+            "forwardingAddress": record.get("forwardingAddress", ""),
             "userId": user_id,
         }
         if ef_required:
