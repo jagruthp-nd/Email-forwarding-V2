@@ -28,8 +28,10 @@ $requiredRoles = @(
     "User.ReadWrite.All",                       # Delete user accounts + remove licenses (POST /users/{id}/assignLicense)
     "MailboxSettings.ReadWrite",                # Read/update mailbox forwarding + OOO settings
     "CustomSecAttributeAssignment.ReadWrite.All", # Read/write Custom Security Attributes (Workflow B)
-    "Mail.Send"                                 # Send mail as SENDER_EMAIL via Graph (no SMTP password)
+    "Mail.Send",                                # Send mail as SENDER_EMAIL via Graph (no SMTP password)
+    "Sites.ReadWrite.All"                       # Upload weekly/monthly reports to SharePoint library
     # Note: User.Read.All is covered by User.ReadWrite.All (superset).
+    # Sites.ReadWrite.All can be narrowed later to Sites.Selected if preferred.
     # The Graph beta endpoint /users/{id}?$select=inPlaceHolds (litigation hold check)
     # requires User.Read.All which is already included in User.ReadWrite.All.
     # Mail.Send is application permission – also restrict send-as mailbox via

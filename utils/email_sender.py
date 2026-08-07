@@ -28,7 +28,10 @@ from typing import Any, Dict, List, Optional
 
 from .app_config import (
     get_admin_emails,
+    get_it_approval_email,
+    get_it_email,
     get_report_emails,
+    get_sender_email,
     get_servicedesk_ticket_url,
     get_sharepoint_report_url,
 )
@@ -65,9 +68,8 @@ def _send(
         )
         return True
 
-    sender = os.environ.get("SENDER_EMAIL", "it-automation-service@netradyne.com")
     return send_mail(
-        sender=sender,
+        sender=get_sender_email(),
         to_address=to_address,
         subject=subject,
         html_body=html_body,
@@ -94,12 +96,13 @@ def send_ef_alert(record: Dict[str, Any], days_remaining: int, is_final: bool = 
         logger.warning("No manager email for userId=%s – skipping alert", record.get("userId"))
         return False
 
-    it_email       = os.environ.get("IT_EMAIL", "it-operations@netradyne.com")
+    it_email       = get_it_email()
     sdp_ticket_url = get_servicedesk_ticket_url()
     employee_name = record.get("displayName", "the terminated employee")
     employee_mail = record.get("userEmail", "")
     offboard_date = record.get("offboardDate", "")
     delete_date   = record.get("deleteDate", "")
+    it_contact    = it_email or "IT Operations"
 
     if is_final:
         urgency_banner = (
@@ -127,7 +130,7 @@ def send_ef_alert(record: Dict[str, Any], days_remaining: int, is_final: bool = 
         )
     else:
         sdp_button = (
-            f'<p style="margin:8px 0 0;">Contact <a href="mailto:{it_email}">{it_email}</a> '
+            f'<p style="margin:8px 0 0;">Contact {it_contact} '
             'to get the ServiceDesk ticket template link.</p>'
         )
 
@@ -191,13 +194,13 @@ def send_ef_alert(record: Dict[str, Any], days_remaining: int, is_final: bool = 
 
     <p style="font-size:13px;color:#888;border-top:1px solid #dee2e6;padding-top:16px;margin-top:24px;">
       This is an automated message from IT Operations.<br>
-      Questions? Contact us at {it_email}
+      Questions? Contact us at {it_contact}
     </p>
   </div>
 </body>
 </html>"""
 
-    return _send(manager_email, subject, html, cc_address=it_email)
+    return _send(manager_email, subject, html, cc_address=it_email or None)
 
 
 def send_ef_removed_notice(record: Dict[str, Any], days_until_delete: int, reason: str) -> bool:
@@ -212,7 +215,8 @@ def send_ef_removed_notice(record: Dict[str, Any], days_until_delete: int, reaso
     if not manager_email:
         return False
 
-    it_email       = os.environ.get("IT_EMAIL", "it-operations@netradyne.com")
+    it_email       = get_it_email()
+    it_contact     = it_email or "IT Operations"
     sdp_ticket_url = get_servicedesk_ticket_url()
     employee_name = record.get("displayName", "the terminated employee")
     employee_mail = record.get("userEmail", "")
@@ -232,7 +236,7 @@ def send_ef_removed_notice(record: Dict[str, Any], days_until_delete: int, reaso
         )
     else:
         sdp_button = (
-            f'<p style="margin:8px 0 0;">Contact <a href="mailto:{it_email}">{it_email}</a> '
+            f'<p style="margin:8px 0 0;">Contact {it_contact} '
             'to raise a ServiceDesk extension ticket.</p>'
         )
 
@@ -286,13 +290,13 @@ def send_ef_removed_notice(record: Dict[str, Any], days_until_delete: int, reaso
 
     <p style="font-size:13px;color:#888;border-top:1px solid #dee2e6;padding-top:16px;margin-top:24px;">
       This is an automated message from IT Operations.<br>
-      Questions? Contact us at {it_email}
+      Questions? Contact us at {it_contact}
     </p>
   </div>
 </body>
 </html>"""
 
-    return _send(manager_email, subject, html, cc_address=it_email)
+    return _send(manager_email, subject, html, cc_address=it_email or None)
 
 
 def send_extension_confirm(record: Dict[str, Any]) -> bool:
@@ -303,7 +307,8 @@ def send_extension_confirm(record: Dict[str, Any]) -> bool:
     if not manager_email:
         return False
 
-    it_email      = os.environ.get("IT_EMAIL", "it-operations@netradyne.com")
+    it_email      = get_it_email()
+    it_contact    = it_email or "IT Operations"
     employee_name = record.get("displayName", "the terminated employee")
     employee_mail = record.get("userEmail", "")
     new_delete    = record.get("deleteDate", "")
@@ -342,13 +347,13 @@ def send_extension_confirm(record: Dict[str, Any]) -> bool:
 
     <p style="font-size:13px;color:#888;border-top:1px solid #dee2e6;padding-top:16px;margin-top:24px;">
       This is an automated confirmation from IT Operations.<br>
-      Questions? Contact us at {it_email}
+      Questions? Contact us at {it_contact}
     </p>
   </div>
 </body>
 </html>"""
 
-    return _send(manager_email, subject, html, cc_address=it_email)
+    return _send(manager_email, subject, html, cc_address=it_email or None)
 
 
 def _send_admin_soft_delete_notice(
@@ -358,10 +363,10 @@ def _send_admin_soft_delete_notice(
     max_policy: bool = False,
 ) -> int:
     """Admin-only notice: deletion is Entra soft-delete (recycle bin ~30 days)."""
-    recipients = get_admin_emails()
-    it_email = os.environ.get("IT_EMAIL", "").strip()
+    recipients = list(get_admin_emails())
+    it_email = get_it_email()
     if it_email and it_email not in recipients:
-        recipients = list(recipients) + [it_email]
+        recipients.append(it_email)
     if not recipients:
         return 0
 
@@ -411,7 +416,8 @@ def send_deletion_notice(record: Dict[str, Any], reason: str) -> bool:
     if not manager_email:
         return False
 
-    it_email      = os.environ.get("IT_EMAIL", "it@netradyne.com")
+    it_email      = get_it_email()
+    it_contact    = it_email or "IT Operations"
     employee_name = record.get("displayName", "the terminated employee")
     employee_mail = record.get("userEmail", "")
     deleted_date  = datetime.now(timezone.utc).strftime("%B %d, %Y")
@@ -449,8 +455,8 @@ def send_deletion_notice(record: Dict[str, Any], reason: str) -> bool:
     <p>Reason: {reason_text}</p>
 
     <p>If this account is still required for business purposes, contact
-    <a href="mailto:{it_email}">{it_email}</a> with subject:
-    <em>Account Recovery – {employee_name}</em>.</p>
+    {('<a href="mailto:' + it_email + '">' + it_email + '</a>') if it_email else it_contact}
+    with subject: <em>Account Recovery – {employee_name}</em>.</p>
 
     <p style="font-size:13px;color:#888;border-top:1px solid #dee2e6;padding-top:16px;margin-top:24px;">
       This is an automated message from IT Operations.
@@ -659,7 +665,7 @@ def send_it_approval_notification(
     Notification sent to the IT approval mailbox when an EF alert fires.
     Contains Approve and Decline buttons (links to the HTTP trigger).
     """
-    it_approval_email = os.environ.get("IT_APPROVAL_EMAIL", "")
+    it_approval_email = get_it_approval_email()
     if not it_approval_email:
         logger.warning("IT_APPROVAL_EMAIL not set – IT approval notification not sent")
         return False
@@ -777,23 +783,7 @@ def send_offboard_consolidated_report(
         return 0
 
     summary = summary or {}
-    sp_url = get_sharepoint_report_url()
-    if sp_url:
-        sp_block = (
-            f'<p style="margin:16px 0;">'
-            f'<a href="{sp_url}" target="_blank" '
-            f'style="display:inline-block;padding:10px 18px;background:#0078d4;color:#fff;'
-            f'text-decoration:none;border-radius:4px;font-weight:bold;">'
-            f'Open report folder in SharePoint</a></p>'
-            f'<p style="font-size:12px;color:#666;">'
-            f'Archive / working copy: <a href="{sp_url}">{sp_url}</a></p>'
-        )
-    else:
-        sp_block = (
-            '<p style="font-size:12px;color:#888;margin:12px 0;">'
-            'SharePoint archive link not configured '
-            '(set SHAREPOINT_SITE_URL / LIBRARY / FOLDER).</p>'
-        )
+    sp_marker = "<!--SP_ARCHIVE_BLOCK-->"
 
     def _rows_no_ef(records: List[Dict[str, Any]], with_days: bool = False) -> str:
         cols = 6 if with_days else 5
@@ -847,7 +837,7 @@ def send_offboard_consolidated_report(
     <p style="margin:6px 0 0;opacity:.9;font-size:14px;">{period_line} · Netradyne IT Automation</p>
   </div>
   <div style="background:#f8f9fa;padding:22px;border:1px solid #dee2e6;border-top:none;border-radius:0 0 6px 6px;">
-    {sp_block}
+    {sp_marker}
 
     <h3 style="margin:8px 0 10px;font-size:15px;">Period activity summary</h3>
     <table style="border-collapse:collapse;font-size:13px;margin-bottom:20px;">
@@ -908,6 +898,70 @@ def send_offboard_consolidated_report(
 </body>
 </html>"""
 
+    # Upload Excel/CSV archives to SharePoint (not HTML — easier long-term handling)
+    from .report_export import build_report_archives
+    from .sharepoint import upload_report_file
+
+    folder_url = get_sharepoint_report_url()
+    archives = build_report_archives(
+        report_date=report_date,
+        period_label=period_label,
+        period_start=period_start or "",
+        new_no_ef=new_no_ef,
+        new_with_ef=new_with_ef,
+        overdue_no_ef=overdue_no_ef,
+        summary=summary,
+    )
+    uploaded: List[Dict[str, Any]] = []
+    last_err = ""
+    for filename, content, content_type in archives:
+        result = upload_report_file(
+            filename=filename,
+            content=content,
+            content_type=content_type,
+        )
+        if result.get("ok") and result.get("web_url"):
+            uploaded.append(result)
+        else:
+            last_err = result.get("error") or "upload skipped"
+            logger.warning("SharePoint archive failed for %s: %s", filename, last_err)
+
+    if uploaded:
+        links = "".join(
+            f'<li style="margin:4px 0;"><a href="{u["web_url"]}" target="_blank">'
+            f'{u["filename"]}</a></li>'
+            for u in uploaded
+        )
+        primary = uploaded[0]
+        sp_block = (
+            f'<p style="margin:16px 0;">'
+            f'<a href="{primary["web_url"]}" target="_blank" '
+            f'style="display:inline-block;padding:10px 18px;background:#0078d4;color:#fff;'
+            f'text-decoration:none;border-radius:4px;font-weight:bold;">'
+            f'Open report data in SharePoint</a></p>'
+            f'<ul style="font-size:13px;color:#666;margin:8px 0;padding-left:20px;">{links}</ul>'
+            f'<p style="font-size:12px;color:#666;">Folder: '
+            f'<a href="{folder_url or primary["web_url"]}">{folder_url or primary["web_url"]}</a></p>'
+        )
+    elif folder_url:
+        sp_block = (
+            f'<p style="margin:16px 0;">'
+            f'<a href="{folder_url}" target="_blank" '
+            f'style="display:inline-block;padding:10px 18px;background:#0078d4;color:#fff;'
+            f'text-decoration:none;border-radius:4px;font-weight:bold;">'
+            f'Open report folder in SharePoint</a></p>'
+            f'<p style="font-size:12px;color:#856404;">Excel/CSV archive not uploaded '
+            f'({last_err or "unknown"}). Folder link still available.</p>'
+        )
+    else:
+        sp_block = (
+            '<p style="font-size:12px;color:#888;margin:12px 0;">'
+            'SharePoint archive not configured '
+            '(set SHAREPOINT_SITE_URL / LIBRARY / FOLDER).</p>'
+        )
+
+    html = html.replace(sp_marker, sp_block, 1)
+
     sent = 0
     for addr in recipients:
         if _send(addr, subject, html):
@@ -930,7 +984,8 @@ def send_final_deletion_notice(record: Dict[str, Any]) -> bool:
     if not manager_email:
         return False
 
-    it_email      = os.environ.get("IT_EMAIL", "it-operations@netradyne.com")
+    it_email      = get_it_email()
+    it_contact    = it_email or "IT Operations"
     employee_name = record.get("displayName", "the terminated employee")
     employee_mail = record.get("userEmail", "")
     deleted_date  = datetime.now(timezone.utc).strftime("%B %d, %Y")
@@ -957,12 +1012,12 @@ def send_final_deletion_notice(record: Dict[str, Any]) -> bool:
     <p>All email forwarding has ceased. No further extensions can be granted.</p>
 
     <p>If this account is still required for business purposes (other than email forwarding),
-    contact <a href="mailto:{it_email}">{it_email}</a> with subject:
-    <em>Account Recovery Request – {employee_name}</em>.</p>
+    contact {('<a href="mailto:' + it_email + '">' + it_email + '</a>') if it_email else it_contact}
+    with subject: <em>Account Recovery Request – {employee_name}</em>.</p>
 
     <p style="font-size:13px;color:#888;border-top:1px solid #dee2e6;padding-top:16px;margin-top:24px;">
       This is an automated message from IT Operations.<br>
-      Questions? Contact <a href="mailto:{it_email}">{it_email}</a>
+      Questions? Contact {it_contact}
     </p>
   </div>
 </body>

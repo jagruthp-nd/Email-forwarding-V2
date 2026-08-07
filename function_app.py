@@ -8,7 +8,8 @@ Triggers:
   2. weekly_report     – Timer, every Monday (WEEKLY_REPORT_SCHEDULE)
   3. monthly_report    – Timer, 1st of month (MONTHLY_REPORT_SCHEDULE)
   4. monthly_cleanup   – Timer, 1st of month (CLEANUP_SCHEDULE) – NO_EF safety-net deletes
-  5. ef_approval       – HTTP Approve/Decline
+  5. ef_approval       – HTTP Approve/Decline (anonymous; token-secured)
+  6. demo              – HTTP team demo walkthrough (requires function key)
 """
 
 import json
@@ -20,6 +21,7 @@ from utils.monitor_accounts  import run_monitor
 from utils.weekly_report     import run_weekly_report, run_monthly_report
 from utils.cleanup_scan      import run_cleanup_scan
 from utils.approval_webhook  import handle_get, handle_post
+from utils.demo_flow         import handle_demo
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +108,33 @@ def monthly_cleanup(cleanup_timer: func.TimerRequest) -> None:
     except Exception as exc:
         logger.critical("monthly_cleanup failed with unhandled exception: %s", exc, exc_info=True)
         raise
+
+
+@app.route(
+    route="demo",
+    methods=["GET", "POST"],
+    auth_level=func.AuthLevel.FUNCTION,
+)
+def demo(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Team demo page. Requires function key (?code=...).
+
+    Examples:
+      /api/demo?code=...
+      /api/demo?code=...&action=emails|report|approval|full
+    """
+    try:
+        action = req.params.get("action", "") or (req.form.get("action") if req.form else "") or ""
+        code = req.params.get("code", "")
+        body, status = handle_demo(action, function_code=code)
+        return func.HttpResponse(body, status_code=status, mimetype="text/html")
+    except Exception as exc:
+        logger.critical("demo failed: %s", exc, exc_info=True)
+        return func.HttpResponse(
+            "<h2>Demo error. Check Function logs.</h2>",
+            status_code=500,
+            mimetype="text/html",
+        )
 
 
 @app.route(

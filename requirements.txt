@@ -9,3 +9,6 @@ azure-identity==1.*
 
 # HTTP client for Microsoft Graph API calls (including Mail.Send)
 requests==2.*
+
+# Excel (.xlsx) report archives for SharePoint
+openpyxl==3.*

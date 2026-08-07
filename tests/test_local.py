@@ -562,6 +562,49 @@ class TestDeletionExemptAndDryRun:
         from utils.app_config import get_servicedesk_ticket_url
         assert get_servicedesk_ticket_url() == "https://sd.example/primary"
 
+    def test_report_export_csv_and_xlsx(self):
+        from utils.report_export import build_report_archives
+        files = build_report_archives(
+            report_date="2026-08-07",
+            period_label="Weekly",
+            period_start="2026-07-31",
+            new_no_ef=[{"displayName": "A", "userEmail": "a@x.com",
+                        "offboardDate": "2026-07-01", "usageLocation": "IN",
+                        "managerEmail": "m@x.com"}],
+            new_with_ef=[{"displayName": "B", "userEmail": "b@x.com",
+                          "offboardDate": "2026-07-02", "usageLocation": "IN",
+                          "managerEmail": "m2@x.com",
+                          "forwardingAddress": "fwd@x.com"}],
+            overdue_no_ef=[],
+            summary={"alerts": 1, "extensions": 0, "deletions": 0, "total_active": 5},
+        )
+        names = {f[0] for f in files}
+        assert any(n.endswith(".csv") for n in names)
+        assert any(n.endswith(".xlsx") for n in names)
+        csv_bytes = next(c for n, c, _ in files if n.endswith(".csv"))
+        assert b"New_EF" in csv_bytes or b"fwd@x.com" in csv_bytes
+        assert len(next(c for n, c, _ in files if n.endswith(".xlsx"))) > 100
+
+    def test_email_config_summary_lists_env_mailboxes(self, monkeypatch):
+        monkeypatch.setenv("SENDER_EMAIL", "sender@x.com")
+        monkeypatch.setenv("IT_EMAIL", "it@x.com")
+        monkeypatch.setenv("IT_APPROVAL_EMAIL", "approve@x.com")
+        monkeypatch.setenv("ADMIN_EMAILS", "a@x.com,b@x.com")
+        monkeypatch.setenv("REPORT_EMAILS", "report@x.com")
+        from utils.app_config import get_email_config_summary
+        s = get_email_config_summary()
+        assert s["SENDER_EMAIL"] == "sender@x.com"
+        assert s["IT_APPROVAL_EMAIL"] == "approve@x.com"
+        assert "a@x.com" in s["ADMIN_EMAILS"]
+        assert "Graph" in s["managers"]
+
+    def test_demo_landing_page(self):
+        from utils.demo_flow import handle_demo
+        html, status = handle_demo("home", function_code="abc")
+        assert status == 200
+        assert "Team Demo" in html
+        assert "action=emails" in html
+
     def test_sharepoint_url_built_from_site_library_folder(self, monkeypatch):
         monkeypatch.delenv("SHAREPOINT_REPORT_URL", raising=False)
         monkeypatch.setenv("SHAREPOINT_SITE_URL", "https://netorg726775.sharepoint.com/sites/ITTEAM259")
