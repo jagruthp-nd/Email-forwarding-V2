@@ -10,6 +10,7 @@ Triggers:
   4. monthly_cleanup   – Timer, 1st of month (CLEANUP_SCHEDULE) – NO_EF safety-net deletes
   5. ef_approval       – HTTP Approve/Decline (anonymous; token-secured)
   6. demo              – HTTP team demo walkthrough (requires function key)
+  7. archive_report    – HTTP immediate Excel/CSV → SharePoint (no email)
 """
 
 import json
@@ -18,7 +19,11 @@ import logging
 import azure.functions as func
 
 from utils.monitor_accounts  import run_monitor
-from utils.weekly_report     import run_weekly_report, run_monthly_report
+from utils.weekly_report     import (
+    run_weekly_report,
+    run_monthly_report,
+    archive_period_report,
+)
 from utils.cleanup_scan      import run_cleanup_scan
 from utils.approval_webhook  import handle_get, handle_post
 from utils.demo_flow         import handle_demo
@@ -108,6 +113,36 @@ def monthly_cleanup(cleanup_timer: func.TimerRequest) -> None:
     except Exception as exc:
         logger.critical("monthly_cleanup failed with unhandled exception: %s", exc, exc_info=True)
         raise
+
+
+@app.route(
+    route="archive_report",
+    methods=["GET", "POST"],
+    auth_level=func.AuthLevel.FUNCTION,
+)
+def archive_report(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Immediate report archive to SharePoint (Excel/CSV). Does not send email.
+
+    Query: lookback_days (default 7), period_label (default OnDemand)
+    """
+    try:
+        lookback = int(req.params.get("lookback_days", "7") or "7")
+        lookback = max(1, min(lookback, 90))
+        label = (req.params.get("period_label") or "OnDemand").strip() or "OnDemand"
+        summary = archive_period_report(label, lookback_days=lookback)
+        return func.HttpResponse(
+            json.dumps(summary, indent=2, default=str),
+            status_code=200 if summary.get("status") == "archived" else 500,
+            mimetype="application/json",
+        )
+    except Exception as exc:
+        logger.critical("archive_report failed: %s", exc, exc_info=True)
+        return func.HttpResponse(
+            json.dumps({"status": "error", "error": str(exc)}),
+            status_code=500,
+            mimetype="application/json",
+        )
 
 
 @app.route(

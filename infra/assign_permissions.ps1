@@ -32,6 +32,11 @@ $requiredRoles = @(
     "Sites.ReadWrite.All"                       # Upload weekly/monthly reports to SharePoint library
     # Note: User.Read.All is covered by User.ReadWrite.All (superset).
     # Sites.ReadWrite.All can be narrowed later to Sites.Selected if preferred.
+    #
+    # ALSO required (Office 365 Exchange Online app, not Microsoft Graph):
+    #   Exchange.ManageAsApp  + Entra role "Exchange Administrator"
+    #   → read/clear M365 Admin Center "Email forwarding" (ForwardingSmtpAddress)
+
     # The Graph beta endpoint /users/{id}?$select=inPlaceHolds (litigation hold check)
     # requires User.Read.All which is already included in User.ReadWrite.All.
     # Mail.Send is application permission – also restrict send-as mailbox via

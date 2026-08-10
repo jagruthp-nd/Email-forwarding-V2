@@ -260,16 +260,24 @@ def _process_user(
     if record.get("statusCode") == "DELETED":
         return "skipped"
 
-    # Re-detect EF if previously unknown (e.g. MailboxSettings permission just granted)
-    if not is_new and not _bool(record.get("efRequired", False)):
+    # Re-detect EF / refresh forwarding target (EXO Admin Center address)
+    if not is_new:
         try:
-            if has_email_forwarding(user_id):
-                fwd = get_forwarding_address(user_id) or ""
+            has_ef = has_email_forwarding(user_id)
+            fwd = get_forwarding_address(user_id) or ""
+            if has_ef and not _bool(record.get("efRequired", False)):
                 record["efRequired"] = True
                 record["forwardingAddress"] = fwd
                 store.upsert_user(record)
-                store.append_audit(user_id, "EF_DETECTED", "Forwarding detected on re-check; switching to EF path.")
-                logger.info("userId=%s EF detected on re-check", user_id)
+                store.append_audit(
+                    user_id, "EF_DETECTED",
+                    f"Forwarding detected on re-check; switching to EF path. to={fwd or '—'}",
+                )
+                logger.info("userId=%s EF detected on re-check → %s", user_id, fwd)
+            elif has_ef and fwd and fwd != (record.get("forwardingAddress") or ""):
+                record["forwardingAddress"] = fwd
+                store.upsert_user(record)
+                logger.info("userId=%s forwardingAddress refreshed → %s", user_id, fwd)
         except Exception as exc:
             logger.warning("userId=%s EF re-check failed: %s", user_id, exc)
 
@@ -487,6 +495,19 @@ def _do_delete(
     is_final: bool = False,
 ) -> str:
     today_str = datetime.now(timezone.utc).date().isoformat()
+
+    from .automation_flags import is_account_deletion_disabled
+    if is_account_deletion_disabled():
+        logger.info(
+            "userId=%s deletion SKIPPED (EF_UAT_MODE / DISABLE_ACCOUNT_DELETION / graph writes off) reason=%s",
+            user_id, reason,
+        )
+        store.append_audit(
+            user_id,
+            "DELETE_SKIPPED_UAT",
+            f"reason={reason}. Account deletion disabled for UAT/safety. EF revoke/emails still allowed.",
+        )
+        return "no_action"
 
     exempt, exempt_reason = is_automated_deletion_exempt(user_id, record)
     if exempt:

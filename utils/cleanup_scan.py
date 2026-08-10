@@ -42,7 +42,7 @@ from .graph_api   import (
     delete_user,
     get_deleted_user,
 )
-from .automation_flags import is_dry_run, log_active_gates
+from .automation_flags import is_account_deletion_disabled, is_dry_run, log_active_gates
 from .deletion_exempt import is_automated_deletion_exempt
 
 logger = logging.getLogger(__name__)
@@ -196,6 +196,17 @@ def _delete_stale(
         logger.info("DRY_RUN: would cleanup-delete userId=%s source=%s", user_id, source)
         store.append_audit(user_id, "DRY_RUN_WOULD_CLEANUP_DELETE", f"source={source}")
         return "dry_run"
+
+    if is_account_deletion_disabled():
+        logger.info(
+            "Cleanup delete SKIPPED (UAT / DISABLE_ACCOUNT_DELETION) userId=%s source=%s",
+            user_id, source,
+        )
+        store.append_audit(
+            user_id, "CLEANUP_SKIPPED_UAT",
+            f"source={source}. Account deletion disabled for UAT/safety.",
+        )
+        return "skipped_uat"
 
     # Check if account is already soft-deleted in Azure AD
     if get_deleted_user(user_id) is not None:

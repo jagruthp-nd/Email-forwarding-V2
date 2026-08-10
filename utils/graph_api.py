@@ -376,71 +376,122 @@ def get_manager(user_id: str) -> Optional[Dict[str, Any]]:
 # Email Forwarding Detection
 # ---------------------------------------------------------------------------
 
-def has_email_forwarding(user_id: str) -> bool:
-    """
-    Detect whether email forwarding is active on this user's mailbox.
+def _user_upn(user_id: str) -> str:
+    data = _get(f"{_GRAPH_BASE}/users/{user_id}?$select=userPrincipalName,mail")
+    if not data:
+        return ""
+    return (data.get("userPrincipalName") or data.get("mail") or "").strip()
 
-    Checks two places:
-      1. Mailbox-level forwardingSmtpAddress (set via IT / Exchange admin)
-      2. Inbox rules with forward/redirect actions (set via rules)
 
-    Returns True if any forwarding is found.
-    """
-    # Check 1: mailbox settings forwarding address
-    settings = _get(f"{_GRAPH_BASE}/users/{user_id}/mailboxSettings")
-    if settings:
-        if settings.get("forwardingSmtpAddress") or settings.get("forwardingAddress"):
-            logger.info("User %s has mailbox-level forwarding", user_id)
-            return True
-
-    # Check 2: inbox rules
+def _addresses_from_inbox_rules(user_id: str) -> list:
+    """Return enabled inbox-rule forward/redirect SMTP addresses."""
+    addrs = []
     rules_data = _get(
         f"{_GRAPH_BASE}/users/{user_id}/mailFolders/inbox/messageRules"
     )
-    if rules_data:
-        for rule in rules_data.get("value", []):
-            actions = rule.get("actions", {})
-            has_fwd = (
-                actions.get("forwardTo")
-                or actions.get("redirectTo")
-                or actions.get("forwardAsAttachmentTo")
-            )
-            if has_fwd and rule.get("isEnabled", True):
-                logger.info("User %s has forwarding inbox rule: %s", user_id, rule.get("displayName"))
-                return True
+    if not rules_data:
+        return addrs
+    for rule in rules_data.get("value", []):
+        if not rule.get("isEnabled", True):
+            continue
+        actions = rule.get("actions") or {}
+        for key in ("forwardTo", "redirectTo", "forwardAsAttachmentTo"):
+            for recip in actions.get(key) or []:
+                addr = (recip.get("emailAddress") or {}).get("address") or ""
+                if addr and addr not in addrs:
+                    addrs.append(addr)
+    return addrs
 
+
+def has_email_forwarding(user_id: str) -> bool:
+    """
+    Detect whether email forwarding is active.
+
+    Order:
+      1. Exchange Online Admin API (M365 Admin Center "Email forwarding")
+      2. Graph mailboxSettings (often unavailable in this tenant)
+      3. Inbox rules with forward/redirect actions
+    """
+    upn = _user_upn(user_id)
+    if upn:
+        try:
+            from .exchange_admin import get_mailbox_forwarding
+            exo = get_mailbox_forwarding(upn)
+            if exo.get("forwardingAddress") or exo.get("enabled"):
+                logger.info("User %s has EXO admin-center forwarding", user_id)
+                return True
+        except Exception as exc:
+            logger.warning("EXO forwarding check failed for %s: %s", user_id, exc)
+
+    settings = _get(f"{_GRAPH_BASE}/users/{user_id}/mailboxSettings")
+    if settings:
+        if settings.get("forwardingSmtpAddress") or settings.get("forwardingAddress"):
+            logger.info("User %s has Graph mailboxSettings forwarding", user_id)
+            return True
+
+    if _addresses_from_inbox_rules(user_id):
+        logger.info("User %s has forwarding inbox rule(s)", user_id)
+        return True
     return False
 
 
 def get_forwarding_address(user_id: str) -> Optional[str]:
     """
-    Return the mailbox-level SMTP forwarding address for *user_id*, or None.
+    Return the best-known SMTP forwarding target for *user_id*, or None.
 
-    Only inspects mailboxSettings (not inbox rules).  Used when creating the
-    initial UserTracking record so the address can be restored if a late
-    extension is approved after EF was disabled at the Day-30 grace point.
+    Prefers M365 Admin Center / EXO ForwardingSmtpAddress, then Graph
+    mailboxSettings, then the first enabled inbox-rule forward target.
     """
+    upn = _user_upn(user_id)
+    if upn:
+        try:
+            from .exchange_admin import get_mailbox_forwarding
+            exo = get_mailbox_forwarding(upn)
+            if exo.get("forwardingAddress"):
+                return exo["forwardingAddress"]
+        except Exception as exc:
+            logger.warning("EXO get_forwarding_address failed for %s: %s", user_id, exc)
+
     settings = _get(f"{_GRAPH_BASE}/users/{user_id}/mailboxSettings")
     if settings:
         addr = settings.get("forwardingSmtpAddress") or settings.get("forwardingAddress")
         if addr:
+            if isinstance(addr, str) and addr.lower().startswith("smtp:"):
+                return addr[5:]
             return addr
-    return None
+
+    rule_addrs = _addresses_from_inbox_rules(user_id)
+    return rule_addrs[0] if rule_addrs else None
 
 
 def disable_email_forwarding(user_id: str) -> bool:
     """
-    Clear mailbox-level email forwarding for a user.
+    Clear email forwarding for a user (Admin Center SMTP + best-effort Graph).
 
-    Called in two scenarios:
-      1. Grace-period EF removal (Day 30 / Day 60 with no approved extension) –
-         forwarding stops but the account stays alive until DELETE_DAY_1/2.
-      2. Account recovery – EF is permanently disabled on recovery.
+    Called on Day-30/60 EF grace removal and on account recovery.
     """
-    ok = _patch(
+    from .automation_flags import is_ef_revoke_disabled
+
+    if is_ef_revoke_disabled():
+        logger.info("EF revoke disabled – skipped disable_email_forwarding for %s", user_id)
+        return True
+
+    upn = _user_upn(user_id)
+    ok = False
+    if upn:
+        try:
+            from .exchange_admin import clear_mailbox_forwarding
+            ok = clear_mailbox_forwarding(upn) or ok
+        except Exception as exc:
+            logger.warning("EXO clear forwarding failed for %s: %s", user_id, exc)
+
+    # Best-effort Graph clear (often unsupported on this tenant)
+    if _patch(
         f"{_GRAPH_BASE}/users/{user_id}/mailboxSettings",
         {"forwardingSmtpAddress": None},
-    )
+    ):
+        ok = True
+
     if ok:
         logger.info("Cleared mailbox forwarding for userId=%s", user_id)
     else:
@@ -450,21 +501,33 @@ def disable_email_forwarding(user_id: str) -> bool:
 
 def enable_email_forwarding(user_id: str, forwarding_address: str) -> bool:
     """
-    (Re-)enable mailbox-level SMTP forwarding for a user.
-
-    Used when a late extension is approved after the Day-30 / Day-60 EF grace
-    removal.  The original forwarding address is stored in the UserTracking
-    record as 'forwardingAddress'.
+    (Re-)enable mailbox-level SMTP forwarding via EXO Set-Mailbox when possible.
     """
     if not forwarding_address:
         logger.warning("enable_email_forwarding called for userId=%s with empty address", user_id)
         return False
+
+    from .automation_flags import is_ef_revoke_disabled
+    if is_ef_revoke_disabled():
+        logger.info("Graph/EF writes disabled – skipped enable_email_forwarding for %s", user_id)
+        return True
+
+    upn = _user_upn(user_id)
+    smtp = forwarding_address if forwarding_address.lower().startswith("smtp:") else f"smtp:{forwarding_address}"
+    if upn:
+        try:
+            from .exchange_admin import set_mailbox_forwarding
+            if set_mailbox_forwarding(upn, forwarding_address):
+                return True
+        except Exception as exc:
+            logger.warning("EXO enable forwarding exception: %s", exc)
+
     ok = _patch(
         f"{_GRAPH_BASE}/users/{user_id}/mailboxSettings",
-        {"forwardingSmtpAddress": forwarding_address},
+        {"forwardingSmtpAddress": smtp},
     )
     if ok:
-        logger.info("Re-enabled mailbox forwarding → %s for userId=%s", forwarding_address, user_id)
+        logger.info("Re-enabled Graph mailbox forwarding → %s for userId=%s", forwarding_address, user_id)
     else:
         logger.warning("Could not re-enable mailbox forwarding for userId=%s", user_id)
     return ok

@@ -35,6 +35,8 @@
     "EF_DRY_RUN":              "false",
     "DISABLE_OUTBOUND_EMAIL":  "false",
     "DISABLE_GRAPH_WRITES":    "false",
+    "EF_UAT_MODE":             "true",
+    "DISABLE_ACCOUNT_DELETION": "true",
 
     "EF_TEST_MODE":            "true",
 

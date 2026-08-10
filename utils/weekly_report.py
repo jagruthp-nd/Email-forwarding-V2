@@ -117,6 +117,76 @@ def _collect_period_data(store: TableStore, lookback_days: int) -> Dict[str, Any
     }
 
 
+def _refresh_ef_forwarding_targets(rows: List[Dict[str, Any]]) -> None:
+    """Fill blank Forwarding-to from EXO Admin Center when possible."""
+    from .graph_api import get_forwarding_address
+
+    for row in rows:
+        if row.get("forwardingAddress"):
+            continue
+        uid = row.get("userId") or ""
+        if not uid:
+            continue
+        try:
+            addr = get_forwarding_address(uid) or ""
+            if addr:
+                row["forwardingAddress"] = addr
+        except Exception:
+            continue
+
+
+def archive_period_report(
+    period_label: str = "OnDemand",
+    lookback_days: int = 7,
+) -> Dict[str, Any]:
+    """
+    Build Excel/CSV archives and upload to SharePoint — no email.
+
+    Used by the HTTP `archive_report` function for immediate reports.
+    """
+    from .report_export import build_report_archives
+    from .sharepoint import upload_report_file
+
+    store = TableStore()
+    store.ensure_tables()
+    data = _collect_period_data(store, lookback_days)
+    _refresh_ef_forwarding_targets(data["new_with_ef"])
+
+    archives = build_report_archives(
+        report_date=data["report_date"],
+        period_label=period_label,
+        period_start=data["period_start"],
+        new_no_ef=data["new_no_ef"],
+        new_with_ef=data["new_with_ef"],
+        overdue_no_ef=data["overdue_no_ef"],
+        summary=data["summary"],
+    )
+    uploaded = []
+    errors = []
+    for filename, content, content_type in archives:
+        result = upload_report_file(
+            filename=filename, content=content, content_type=content_type,
+        )
+        if result.get("ok"):
+            uploaded.append({"filename": filename, "web_url": result.get("web_url", "")})
+        else:
+            errors.append({"filename": filename, "error": result.get("error", "")})
+
+    summary = {
+        "status": "archived" if uploaded else "failed",
+        "period": period_label,
+        "email_sent": False,
+        "uploaded": uploaded,
+        "errors": errors,
+        "new_no_ef": len(data["new_no_ef"]),
+        "new_with_ef": len(data["new_with_ef"]),
+        "overdue_no_ef": len(data["overdue_no_ef"]),
+        **data["summary"],
+    }
+    logger.info("Archive-only report: %s", summary)
+    return summary
+
+
 def _send_period_report(period_label: str, lookback_days: int) -> Dict[str, Any]:
     recipients = get_report_emails()
     if not recipients:
@@ -126,6 +196,7 @@ def _send_period_report(period_label: str, lookback_days: int) -> Dict[str, Any]
     store = TableStore()
     store.ensure_tables()
     data = _collect_period_data(store, lookback_days)
+    _refresh_ef_forwarding_targets(data["new_with_ef"])
 
     sent = send_offboard_consolidated_report(
         report_date=data["report_date"],
@@ -166,3 +237,8 @@ def run_weekly_report() -> Dict[str, Any]:
 def run_monthly_report() -> Dict[str, Any]:
     """Monthly report (default lookback 31 days)."""
     return _send_period_report("Monthly", lookback_days=31)
+
+
+def run_archive_report(lookback_days: int = 7) -> Dict[str, Any]:
+    """Immediate SharePoint archive (no email)."""
+    return archive_period_report("OnDemand", lookback_days=lookback_days)
