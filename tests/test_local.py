@@ -605,6 +605,16 @@ class TestDeletionExemptAndDryRun:
         assert "Team Demo" in html
         assert "action=emails" in html
 
+    def test_uat_console_landing(self, monkeypatch):
+        monkeypatch.setenv("EF_UAT_MODE", "true")
+        monkeypatch.setenv("DISABLE_ACCOUNT_DELETION", "true")
+        from utils.uat_console import handle_uat
+        html, status = handle_uat("home", function_code="abc")
+        assert status == 200
+        assert "UAT Console" in html
+        assert "action=archive" in html
+        assert "litigation" in html.lower() or "Litigation" in html
+
     def test_sharepoint_url_built_from_site_library_folder(self, monkeypatch):
         monkeypatch.delenv("SHAREPOINT_REPORT_URL", raising=False)
         monkeypatch.setenv("SHAREPOINT_SITE_URL", "https://netorg726775.sharepoint.com/sites/ITTEAM259")

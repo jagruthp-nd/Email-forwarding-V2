@@ -11,6 +11,7 @@ Triggers:
   5. ef_approval       – HTTP Approve/Decline (anonymous; token-secured)
   6. demo              – HTTP team demo walkthrough (requires function key)
   7. archive_report    – HTTP immediate Excel/CSV → SharePoint (no email)
+  8. uat               – HTTP UAT console (settings + on-demand archive/report)
 """
 
 import json
@@ -27,6 +28,7 @@ from utils.weekly_report     import (
 from utils.cleanup_scan      import run_cleanup_scan
 from utils.approval_webhook  import handle_get, handle_post
 from utils.demo_flow         import handle_demo
+from utils.uat_console       import handle_uat
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +115,40 @@ def monthly_cleanup(cleanup_timer: func.TimerRequest) -> None:
     except Exception as exc:
         logger.critical("monthly_cleanup failed with unhandled exception: %s", exc, exc_info=True)
         raise
+
+
+@app.route(
+    route="uat",
+    methods=["GET", "POST"],
+    auth_level=func.AuthLevel.FUNCTION,
+)
+def uat(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    UAT console: view safety gates, archive report to SharePoint, optional email report.
+
+    Examples:
+      /api/uat?code=...
+      /api/uat?code=...&action=archive
+      /api/uat?code=...&action=archive30
+      /api/uat?code=...&action=email_report
+    """
+    try:
+        action = req.params.get("action", "") or ""
+        code = req.params.get("code", "")
+        try:
+            lookback = int(req.params.get("lookback_days", "7") or "7")
+        except ValueError:
+            lookback = 7
+        lookback = max(1, min(lookback, 90))
+        body, status = handle_uat(action, function_code=code, lookback_days=lookback)
+        return func.HttpResponse(body, status_code=status, mimetype="text/html")
+    except Exception as exc:
+        logger.critical("uat console failed: %s", exc, exc_info=True)
+        return func.HttpResponse(
+            "<h2>UAT console error. Check Function logs.</h2>",
+            status_code=500,
+            mimetype="text/html",
+        )
 
 
 @app.route(
