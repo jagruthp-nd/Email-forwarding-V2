@@ -23,6 +23,7 @@ Account safety rules:
   - Already marked DELETED in UserTracking → SKIP
   - deletionExempt / skipCleanupDeletion on UserTracking → SKIP
   - DELETION_EXEMPT_USER_IDS / DELETION_EXEMPT_EMAILS app settings → SKIP
+  - Entra CSA EFAutomation.DeleteExempt (truthy) → SKIP
   - Account still has active email forwarding → SKIP (log warning, let daily monitor handle)
   - Account already deleted from Azure AD (soft-deleted / 404) → mark DELETED in tracking, SKIP
 """
@@ -32,7 +33,7 @@ from __future__ import annotations
 import logging
 import os
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from .table_store import TableStore
 from .graph_api   import (
@@ -148,7 +149,9 @@ def run_cleanup_scan() -> Dict[str, int]:
             "statusCode":   "ACTIVE",
             "managerEmail": "",
         }
-        result = _delete_stale(user_id, stub, store, source="untracked_ad_account")
+        result = _delete_stale(
+            user_id, stub, store, source="untracked_ad_account", ad_user=user,
+        )
         _tally(summary, result)
 
     logger.info(
@@ -171,6 +174,7 @@ def _delete_stale(
     record: Dict[str, Any],
     store: TableStore,
     source: str,
+    ad_user: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Delete one stale account if safe to do so.
@@ -178,7 +182,10 @@ def _delete_stale(
     Returns: 'deleted' | 'skipped_already_deleted' | 'skipped_has_ef' | 'skipped_exempt' | 'dry_run' | 'error'
     """
     exempt, exempt_reason = is_automated_deletion_exempt(
-        user_id, record, user_email=record.get("userEmail", ""),
+        user_id,
+        record,
+        user_email=record.get("userEmail", ""),
+        ad_user=ad_user,
     )
     if exempt:
         logger.info(

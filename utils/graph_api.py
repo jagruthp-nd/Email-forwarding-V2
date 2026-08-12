@@ -257,11 +257,12 @@ def get_terminated_users() -> List[Dict[str, Any]]:
 #
 # One-time setup in Azure AD admin center before first use:
 #   1. Create attribute set:  name = CSA_ATTRIBUTE_SET  (default "EFAutomation")
-#   2. Create attribute:      name = CSA_ATTRIBUTE_NAME (default "ExtensionStatus")
-#                             type = String, single-value, not predefined values
-#   3. Grant managed identity the "Attribute Assignment Administrator" role
-#      (or the CustomSecAttributeAssignment.ReadWrite.All app permission –
-#       see infra/assign_permissions.ps1)
+#   2. Create ExtStatus:      CSA_ATTRIBUTE_NAME (default "ExtStatus")
+#   3. Create TicketRef:      CSA_TICKET_REF_NAME (default "TicketRef")
+#   4. Create DeleteExempt:   CSA_DELETE_EXEMPT_NAME (default "DeleteExempt")
+#                             Boolean preferred, or String (true / EXEMPT)
+#   5. Grant app CustomSecAttributeAssignment.ReadWrite.All (see assign_permissions.ps1)
+#      IT Engineers need Attribute Assignment Administrator to set CSA in portal.
 # ---------------------------------------------------------------------------
 
 #: Azure AD Custom Security Attribute set name (configure via env var).
@@ -270,6 +271,8 @@ CSA_ATTRIBUTE_SET  = os.environ.get("CSA_ATTRIBUTE_SET",  "EFAutomation")
 CSA_ATTRIBUTE_NAME = os.environ.get("CSA_ATTRIBUTE_NAME", "ExtStatus")
 #: Azure AD Custom Security Attribute name for the SD+ ticket reference.
 CSA_TICKET_REF_NAME = os.environ.get("CSA_TICKET_REF_NAME", "TicketRef")
+#: CSA name for operational delete-exempt (Boolean or String True/EXEMPT).
+CSA_DELETE_EXEMPT_NAME = os.environ.get("CSA_DELETE_EXEMPT_NAME", "DeleteExempt")
 
 #: Predefined CSA values IT Engineers select to signal an approved extension.
 #: These must exactly match the predefined values configured on the CSA attribute
@@ -277,6 +280,12 @@ CSA_TICKET_REF_NAME = os.environ.get("CSA_TICKET_REF_NAME", "TicketRef")
 #: "Allow only predefined values" = Yes).  EF_ALERT_SENT is also in the predefined
 #: list so the automation can write it via the Graph API.
 _APPROVED_VALUES: frozenset = frozenset({"EXTEND_TO_30", "EXTEND_TO_60", "EXTENDED_MAX"})
+_DELETE_EXEMPT_TRUTHY = frozenset({"true", "1", "yes", "exempt", "y"})
+
+
+def _csa_attr_set(user: Dict[str, Any]) -> Dict[str, Any]:
+    csa = user.get("customSecurityAttributes") or {}
+    return csa.get(CSA_ATTRIBUTE_SET) or {}
 
 
 def get_extension_attribute(user: Dict[str, Any]) -> Optional[str]:
@@ -287,10 +296,45 @@ def get_extension_attribute(user: Dict[str, Any]) -> Optional[str]:
     The user dict must have been fetched with $select=customSecurityAttributes
     (handled by get_terminated_users).
     """
-    csa = user.get("customSecurityAttributes") or {}
-    attr_set = csa.get(CSA_ATTRIBUTE_SET) or {}
-    value = (attr_set.get(CSA_ATTRIBUTE_NAME) or "").strip()
+    value = (_csa_attr_set(user).get(CSA_ATTRIBUTE_NAME) or "")
+    if isinstance(value, str):
+        value = value.strip()
     return value or None
+
+
+def get_delete_exempt_csa_value(user: Dict[str, Any]) -> Any:
+    """Raw CSA DeleteExempt value from a user dict (bool or str), or None."""
+    return _csa_attr_set(user).get(CSA_DELETE_EXEMPT_NAME)
+
+
+def is_csa_delete_exempt(
+    user: Optional[Dict[str, Any]] = None,
+    user_id: str = "",
+) -> bool:
+    """
+    True when Entra CSA EFAutomation.DeleteExempt (or CSA_DELETE_EXEMPT_NAME) is set.
+
+    Accepts Boolean true or string values: true / yes / 1 / EXEMPT.
+    If *user* is omitted, fetches customSecurityAttributes for *user_id*.
+    """
+    ad_user = user
+    if ad_user is None and user_id:
+        ad_user = _get(
+            f"{_GRAPH_BASE}/users/{user_id}?$select=id,customSecurityAttributes"
+        )
+    if not ad_user:
+        return False
+
+    raw = get_delete_exempt_csa_value(ad_user)
+    if raw is None or raw is False:
+        return False
+    if raw is True:
+        return True
+    if isinstance(raw, (int, float)):
+        return raw != 0
+    if isinstance(raw, str):
+        return raw.strip().lower() in _DELETE_EXEMPT_TRUTHY
+    return bool(raw)
 
 
 def is_extension_approved(user: Dict[str, Any]) -> bool:

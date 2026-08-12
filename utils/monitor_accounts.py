@@ -309,7 +309,7 @@ def _process_user(
     #   Admin notice is via weekly/monthly consolidated report (not per-user email).
     if not ef_required:
         if _AUTO_DELETE_NO_EF and days_elapsed >= _EF_REMOVE_1:
-            return _do_delete(user_id, record, "NO_EF", store)
+            return _do_delete(user_id, record, "NO_EF", store, ad_user=user)
         return "no_action"
 
     # ── 5. HAS EF – Workflow B attribute check (runs before alert/EF-remove/delete) ──
@@ -341,7 +341,7 @@ def _process_user(
 
         # ── 6c. Delete (Day DELETE_DAY_1+) ────────────────────────────────
         if days_elapsed >= _DELETE_DAY_1:
-            return _do_delete(user_id, record, "NO_EXTENSION_DAY30", store)
+            return _do_delete(user_id, record, "NO_EXTENSION_DAY30", store, ad_user=user)
 
     elif ext_count == 1:
         # ── 6d. Alert window 2 (Day ALERT_DAY_2 … EF_REMOVE_2 - 1) ───────
@@ -362,7 +362,7 @@ def _process_user(
 
         # ── 6f. Delete (Day DELETE_DAY_2+) ────────────────────────────────
         if days_elapsed >= _DELETE_DAY_2:
-            return _do_delete(user_id, record, "NO_EXTENSION_DAY60", store)
+            return _do_delete(user_id, record, "NO_EXTENSION_DAY60", store, ad_user=user)
 
     elif ext_count == 2:
         # ── 6g. Final alert window (Day ALERT_DAY_3 … DELETE_DAY_3 - 1) ──
@@ -373,7 +373,9 @@ def _process_user(
 
         # ── 6h. Final delete (Day 90+) – no grace period at max policy ────
         if days_elapsed >= _DELETE_DAY_3:
-            return _do_delete(user_id, record, "MAX_POLICY_DAY90", store, is_final=True)
+            return _do_delete(
+                user_id, record, "MAX_POLICY_DAY90", store, is_final=True, ad_user=user,
+            )
 
     return "no_action"
 
@@ -493,6 +495,7 @@ def _do_delete(
     reason: str,
     store: TableStore,
     is_final: bool = False,
+    ad_user: Optional[Dict[str, Any]] = None,
 ) -> str:
     today_str = datetime.now(timezone.utc).date().isoformat()
 
@@ -509,7 +512,12 @@ def _do_delete(
         )
         return "no_action"
 
-    exempt, exempt_reason = is_automated_deletion_exempt(user_id, record)
+    exempt, exempt_reason = is_automated_deletion_exempt(
+        user_id,
+        record,
+        user_email=record.get("userEmail", ""),
+        ad_user=ad_user,
+    )
     if exempt:
         logger.info(
             "userId=%s automated deletion SKIPPED (exempt=%s) reason=%s",

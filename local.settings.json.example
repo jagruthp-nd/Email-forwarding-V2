@@ -51,9 +51,10 @@
     "DELETION_EXEMPT_USER_IDS": "",
     "DELETION_EXEMPT_EMAILS":   "",
 
-    "CSA_ATTRIBUTE_SET":     "EFAutomation",
-    "CSA_ATTRIBUTE_NAME":    "ExtStatus",
-    "CSA_TICKET_REF_NAME":   "TicketRef",
+    "CSA_ATTRIBUTE_SET":       "EFAutomation",
+    "CSA_ATTRIBUTE_NAME":      "ExtStatus",
+    "CSA_TICKET_REF_NAME":     "TicketRef",
+    "CSA_DELETE_EXEMPT_NAME":  "DeleteExempt",
 
     "OOO_MAX_DAYS":             "30",
     "APPROVAL_TOKEN_DAYS":      "7",

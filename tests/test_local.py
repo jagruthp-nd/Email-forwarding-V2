@@ -537,6 +537,55 @@ class TestDeletionExemptAndDryRun:
         assert result == "skipped_exempt"
         mock_del.assert_not_called()
 
+    def test_delete_skipped_when_csa_delete_exempt(self):
+        """CSA DeleteExempt=true blocks soft-delete without env/config edits."""
+        store = MagicMock()
+        store.get_compliance_record.return_value = None
+        record = make_record(offboard_days_ago=46, ef_required=True, extension_count=0, status="EF_DISABLED")
+        ad = make_ad_user(46)
+        ad["customSecurityAttributes"] = {
+            "EFAutomation": {
+                "@odata.type": "#microsoft.graph.customSecurityAttributeValue",
+                "DeleteExempt": True,
+            }
+        }
+        with patch("utils.monitor_accounts.delete_user") as mock_del:
+            from utils.monitor_accounts import _process_user
+            result = _process_user(ad, date.today(), store, record)
+        assert result == "no_action"
+        mock_del.assert_not_called()
+        assert store.append_audit.call_args[0][1] == "DELETE_SKIPPED_EXEMPT"
+
+    def test_cleanup_skips_csa_delete_exempt_string(self):
+        store = MagicMock()
+        record = make_record(offboard_days_ago=35, ef_required=False)
+        ad = {
+            "id": "user-csa-exempt",
+            "customSecurityAttributes": {
+                "EFAutomation": {"DeleteExempt": "EXEMPT"},
+            },
+        }
+        from utils.cleanup_scan import _delete_stale
+        with patch("utils.cleanup_scan.delete_user") as mock_del:
+            result = _delete_stale(
+                "user-csa-exempt", record, store, source="test", ad_user=ad,
+            )
+        assert result == "skipped_exempt"
+        mock_del.assert_not_called()
+
+    def test_is_csa_delete_exempt_helpers(self):
+        from utils.graph_api import is_csa_delete_exempt
+        assert is_csa_delete_exempt(user={"customSecurityAttributes": {}}) is False
+        assert is_csa_delete_exempt(user={
+            "customSecurityAttributes": {"EFAutomation": {"DeleteExempt": True}},
+        }) is True
+        assert is_csa_delete_exempt(user={
+            "customSecurityAttributes": {"EFAutomation": {"DeleteExempt": "yes"}},
+        }) is True
+        assert is_csa_delete_exempt(user={
+            "customSecurityAttributes": {"EFAutomation": {"DeleteExempt": False}},
+        }) is False
+
     def test_dry_run_blocks_cleanup_delete(self, monkeypatch):
         monkeypatch.setenv("EF_DRY_RUN", "true")
         store = MagicMock()
