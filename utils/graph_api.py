@@ -260,7 +260,7 @@ def get_terminated_users() -> List[Dict[str, Any]]:
 #   2. Create ExtStatus:      CSA_ATTRIBUTE_NAME (default "ExtStatus")
 #   3. Create TicketRef:      CSA_TICKET_REF_NAME (default "TicketRef")
 #   4. Create DeleteExempt:   CSA_DELETE_EXEMPT_NAME (default "DeleteExempt")
-#                             Boolean preferred, or String (true / EXEMPT)
+#                             String predefined: no | yes | true  (yes/true = exempt)
 #   5. Grant app CustomSecAttributeAssignment.ReadWrite.All (see assign_permissions.ps1)
 #      IT Engineers need Attribute Assignment Administrator to set CSA in portal.
 # ---------------------------------------------------------------------------
@@ -271,7 +271,7 @@ CSA_ATTRIBUTE_SET  = os.environ.get("CSA_ATTRIBUTE_SET",  "EFAutomation")
 CSA_ATTRIBUTE_NAME = os.environ.get("CSA_ATTRIBUTE_NAME", "ExtStatus")
 #: Azure AD Custom Security Attribute name for the SD+ ticket reference.
 CSA_TICKET_REF_NAME = os.environ.get("CSA_TICKET_REF_NAME", "TicketRef")
-#: CSA name for operational delete-exempt (Boolean or String True/EXEMPT).
+#: CSA name for operational delete-exempt (String predefined: no | yes | true).
 CSA_DELETE_EXEMPT_NAME = os.environ.get("CSA_DELETE_EXEMPT_NAME", "DeleteExempt")
 
 #: Predefined CSA values IT Engineers select to signal an approved extension.
@@ -280,7 +280,8 @@ CSA_DELETE_EXEMPT_NAME = os.environ.get("CSA_DELETE_EXEMPT_NAME", "DeleteExempt"
 #: "Allow only predefined values" = Yes).  EF_ALERT_SENT is also in the predefined
 #: list so the automation can write it via the Graph API.
 _APPROVED_VALUES: frozenset = frozenset({"EXTEND_TO_30", "EXTEND_TO_60", "EXTENDED_MAX"})
-_DELETE_EXEMPT_TRUTHY = frozenset({"true", "1", "yes", "exempt", "y"})
+#: Matches Entra DeleteExempt predefined values (plus a few aliases).
+_DELETE_EXEMPT_TRUTHY = frozenset({"true", "yes", "1", "exempt", "y"})
 
 
 def _csa_attr_set(user: Dict[str, Any]) -> Dict[str, Any]:

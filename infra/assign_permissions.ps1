@@ -113,11 +113,13 @@ Write-Host "" -ForegroundColor Yellow
 Write-Host "  Step 4b – Add DeleteExempt CSA attribute (operational hold-off):" -ForegroundColor Yellow
 Write-Host "    In the same EFAutomation attribute set, create:" -ForegroundColor Yellow
 Write-Host "         Name:                  DeleteExempt     (matches env var CSA_DELETE_EXEMPT_NAME)" -ForegroundColor Yellow
-Write-Host "         Data type:             Boolean          (preferred)" -ForegroundColor Yellow
+Write-Host "         Data type:             String" -ForegroundColor Yellow
 Write-Host "         Multi-value:           No" -ForegroundColor Yellow
-Write-Host "    OR Data type String with free text; truthy values: true / yes / 1 / EXEMPT." -ForegroundColor Yellow
-Write-Host "    When set on a user, daily monitor + monthly cleanup will NOT soft-delete," -ForegroundColor Yellow
-Write-Host "    even without EF or litigation hold. Clear the CSA when deletion is OK." -ForegroundColor Yellow
+Write-Host "         Allow only predefined: Yes" -ForegroundColor Yellow
+Write-Host "         Predefined values:     no | yes | true" -ForegroundColor Yellow
+Write-Host "    Automation treats yes/true as exempt; no (or unset) allows deletion." -ForegroundColor Yellow
+Write-Host "    When set yes/true, daily monitor + monthly cleanup will NOT soft-delete," -ForegroundColor Yellow
+Write-Host "    even without EF or litigation hold. Set back to no when deletion is OK." -ForegroundColor Yellow
 Write-Host "    No Function App config changes needed per user." -ForegroundColor Yellow
 Write-Host "" -ForegroundColor Yellow
 Write-Host "  Step 5 – License removal (User.ReadWrite.All covers this):" -ForegroundColor Yellow
