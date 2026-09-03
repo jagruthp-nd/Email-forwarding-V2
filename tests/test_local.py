@@ -44,11 +44,16 @@ def make_record(
     extension_count: int = 0,
     status: str = "ACTIVE",
     last_alert: str = "",
+    pre_deletion_notice_days_ago: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Return a synthetic UserTracking dict."""
     today = date.today()
     offboard = today - timedelta(days=offboard_days_ago)
     delete_date = offboard + timedelta(days=(extension_count + 1) * 30)
+    notice_date = (
+        (today - timedelta(days=pre_deletion_notice_days_ago)).isoformat()
+        if pre_deletion_notice_days_ago is not None else ""
+    )
     return {
         "userId":              user_id,
         "userEmail":           f"{user_id}@netradyne.com",
@@ -72,6 +77,8 @@ def make_record(
         "legalHoldChecked":    "",
         "legalHoldActive":     False,
         "licensesRemovedDate": "",
+        "preDeletionNoticeDate": notice_date,
+        "sessionsRevokedDate": "",
     }
 
 
@@ -127,35 +134,73 @@ class TestMonitorDecisionLogic:
         from utils.monitor_accounts import _process_user
         return _process_user(ad_user, today, store, existing_record)
 
-    # ── No EF ────────────────────────────────────────────────────────────
+    # ── No EF (policy 4.6.2 – 15-day retention, notice before deletion) ──
 
-    def test_no_ef_before_day30_no_action(self):
+    def test_no_ef_before_notice_day_no_action(self):
+        """Before NO_EF_NOTICE_DAY nothing happens."""
         store = MagicMock()
-        record = make_record(offboard_days_ago=10, ef_required=False)
+        record = make_record(offboard_days_ago=5, ef_required=False)
         today = date.today()
-        with patch("utils.monitor_accounts.delete_user") as mock_del:
-            ad = make_ad_user(10)
+        with patch("utils.monitor_accounts.delete_user") as mock_del, \
+             patch("utils.monitor_accounts.send_no_ef_pre_deletion_notice") as mock_notice:
+            ad = make_ad_user(5)
             result = self._run(ad, today, store, record)
         assert result == "no_action"
         mock_del.assert_not_called()
+        mock_notice.assert_not_called()
 
-    def test_no_ef_day30_default_no_action(self):
-        """Default (AUTO_DELETE_NO_EF=false): NO_EF account on Day 30 → no_action.
-        Monthly cleanup scan is the safety net; daily monitor does not auto-delete."""
-        store = MagicMock()
-        record = make_record(offboard_days_ago=30, ef_required=False)
-        today = date.today()
-        with patch("utils.monitor_accounts.delete_user") as mock_del:
-            ad = make_ad_user(30)
-            result = self._run(ad, today, store, record)
-        assert result == "no_action"
-        mock_del.assert_not_called()
-
-    def test_no_ef_day30_auto_delete_flag_deletes(self):
-        """With AUTO_DELETE_NO_EF=true: NO_EF account on Day 30 → deleted (legacy mode)."""
+    def test_no_ef_notice_day_sends_pre_deletion_notice(self):
+        """Day 10: manager and business owner are notified before deletion."""
         store = MagicMock()
         store.get_compliance_record.return_value = None
-        record = make_record(offboard_days_ago=30, ef_required=False)
+        record = make_record(offboard_days_ago=10, ef_required=False)
+        today = date.today()
+        with patch("utils.monitor_accounts.delete_user") as mock_del, \
+             patch("utils.monitor_accounts.send_no_ef_pre_deletion_notice", return_value=True) as mock_notice:
+            ad = make_ad_user(10)
+            result = self._run(ad, today, store, record)
+        assert result == "notified"
+        mock_notice.assert_called_once()
+        assert mock_notice.call_args.kwargs["retention_days"] == 15
+        assert mock_notice.call_args.kwargs["days_until_delete"] == 5
+        # Stamped in UTC, like every other date the automation writes.
+        assert record["preDeletionNoticeDate"] == datetime.now(timezone.utc).date().isoformat()
+        mock_del.assert_not_called()
+
+    def test_no_ef_notice_sent_only_once(self):
+        """A record that already carries a notice date is not notified again."""
+        store = MagicMock()
+        record = make_record(
+            offboard_days_ago=12, ef_required=False, pre_deletion_notice_days_ago=2,
+        )
+        today = date.today()
+        with patch("utils.monitor_accounts.send_no_ef_pre_deletion_notice") as mock_notice:
+            ad = make_ad_user(12)
+            result = self._run(ad, today, store, record)
+        assert result == "no_action"
+        mock_notice.assert_not_called()
+
+    def test_no_ef_day15_default_no_action(self):
+        """Default (AUTO_DELETE_NO_EF=false): the daily monitor never deletes.
+        Monthly cleanup scan is the safety net."""
+        store = MagicMock()
+        record = make_record(
+            offboard_days_ago=15, ef_required=False, pre_deletion_notice_days_ago=5,
+        )
+        today = date.today()
+        with patch("utils.monitor_accounts.delete_user") as mock_del:
+            ad = make_ad_user(15)
+            result = self._run(ad, today, store, record)
+        assert result == "no_action"
+        mock_del.assert_not_called()
+
+    def test_no_ef_day15_auto_delete_deletes_after_notice(self):
+        """AUTO_DELETE_NO_EF=true and notice lead time met → delete on Day 15."""
+        store = MagicMock()
+        store.get_compliance_record.return_value = None
+        record = make_record(
+            offboard_days_ago=15, ef_required=False, pre_deletion_notice_days_ago=5,
+        )
         today = date.today()
         import utils.monitor_accounts as ma
         original = ma._AUTO_DELETE_NO_EF
@@ -165,23 +210,54 @@ class TestMonitorDecisionLogic:
                  patch("utils.monitor_accounts.send_deletion_notice"), \
                  patch("utils.monitor_accounts.is_litigation_hold_active", return_value=False), \
                  patch("utils.monitor_accounts.remove_all_licenses", return_value=True):
-                ad = make_ad_user(30)
+                ad = make_ad_user(15)
                 result = self._run(ad, today, store, record)
                 assert result == "deleted"
             mock_del.assert_called_once_with(record["userId"])
         finally:
             ma._AUTO_DELETE_NO_EF = original
 
-    def test_no_ef_past_day30_still_no_action(self):
-        """Day 35, NO_EF, AUTO_DELETE_NO_EF=false → no_action (monthly cleanup handles)."""
+    def test_no_ef_day15_deletion_deferred_until_notice_sent(self):
+        """Deletion is held on Day 15 when no notice has gone out yet (policy 4.6.2)."""
         store = MagicMock()
-        record = make_record(offboard_days_ago=35, ef_required=False)
+        store.get_compliance_record.return_value = None
+        record = make_record(offboard_days_ago=15, ef_required=False)
         today = date.today()
-        with patch("utils.monitor_accounts.delete_user") as mock_del:
-            ad = make_ad_user(35)
-            result = self._run(ad, today, store, record)
-        assert result == "no_action"
-        mock_del.assert_not_called()
+        import utils.monitor_accounts as ma
+        original = ma._AUTO_DELETE_NO_EF
+        try:
+            ma._AUTO_DELETE_NO_EF = True
+            with patch("utils.monitor_accounts.delete_user") as mock_del, \
+                 patch("utils.monitor_accounts.send_no_ef_pre_deletion_notice", return_value=True) as mock_notice:
+                ad = make_ad_user(15)
+                result = self._run(ad, today, store, record)
+            assert result == "notified"
+            mock_notice.assert_called_once()
+            mock_del.assert_not_called()
+            audit_actions = [c[0][1] for c in store.append_audit.call_args_list]
+            assert "DELETE_DEFERRED_PENDING_NOTICE" in audit_actions
+        finally:
+            ma._AUTO_DELETE_NO_EF = original
+
+    def test_no_ef_deletion_deferred_when_notice_too_recent(self):
+        """Notice sent yesterday → lead time not met → still no deletion."""
+        store = MagicMock()
+        store.get_compliance_record.return_value = None
+        record = make_record(
+            offboard_days_ago=16, ef_required=False, pre_deletion_notice_days_ago=1,
+        )
+        today = date.today()
+        import utils.monitor_accounts as ma
+        original = ma._AUTO_DELETE_NO_EF
+        try:
+            ma._AUTO_DELETE_NO_EF = True
+            with patch("utils.monitor_accounts.delete_user") as mock_del:
+                ad = make_ad_user(16)
+                result = self._run(ad, today, store, record)
+            assert result == "no_action"
+            mock_del.assert_not_called()
+        finally:
+            ma._AUTO_DELETE_NO_EF = original
 
     # ── Has EF – alert path ───────────────────────────────────────────────
 
@@ -722,23 +798,69 @@ class TestDeletionExemptAndDryRun:
         assert setting["externalReplyMessage"] == ""
         assert "mgr@netradyne.com" in setting["internalReplyMessage"]
 
-    def test_ef_test_mode_redirects_to_and_strips_cc(self, monkeypatch):
-        monkeypatch.setenv("EF_TEST_MODE", "true")
-        monkeypatch.setenv("EF_TEST_RECIPIENT", "prem_testing@netradyne.com")
-        monkeypatch.setenv("DISABLE_OUTBOUND_EMAIL", "false")
-        monkeypatch.setenv("EF_DRY_RUN", "false")
-        monkeypatch.setenv("SENDER_EMAIL", "it-automation-service@netradyne.com")
-
-        with patch("utils.email_sender.send_mail", return_value=True) as mock_send:
-            from utils.email_sender import _send
-            ok = _send(
-                "manager@netradyne.com",
-                "Test subject",
-                "<p>hi</p>",
-                cc_address="it-operations@netradyne.com",
+    def test_ooo_uses_policy_wording_when_forwarding_active(self):
+        """Policy 4.2.3 internal wording, naming the manager as the contact."""
+        with patch("utils.graph_api._patch", return_value=True) as mock_patch:
+            from utils.graph_api import set_auto_reply
+            ok = set_auto_reply(
+                "uid", "Mgr Name", "mgr@netradyne.com", forwarding_active=True,
             )
         assert ok is True
-        mock_send.assert_called_once()
-        kwargs = mock_send.call_args.kwargs
-        assert kwargs["to_address"] == "prem_testing@netradyne.com"
-        assert kwargs["cc_address"] is None
+        msg = mock_patch.call_args[0][1]["automaticRepliesSetting"]["internalReplyMessage"]
+        assert "no longer monitored" in msg
+        assert "automatically forwarded to the employee's manager" in msg
+        assert "Mgr Name at mgr@netradyne.com" in msg
+
+    def test_ooo_omits_contact_when_manager_unknown(self):
+        """No manager on the Entra record → generic wording, no dangling contact."""
+        with patch("utils.graph_api._patch", return_value=True) as mock_patch:
+            from utils.graph_api import set_auto_reply
+            set_auto_reply("uid", "", "", forwarding_active=True)
+        msg = mock_patch.call_args[0][1]["automaticRepliesSetting"]["internalReplyMessage"]
+        assert msg.endswith("for further review and action.")
+        assert "manager," not in msg
+
+
+# ---------------------------------------------------------------------------
+# Tests: pre-deletion notice gate in the monthly cleanup scan (policy 4.6.2)
+# ---------------------------------------------------------------------------
+
+class TestCleanupPreDeletionNotice:
+    def test_cleanup_defers_when_notice_not_sent(self, monkeypatch):
+        monkeypatch.delenv("EF_DRY_RUN", raising=False)
+        monkeypatch.setenv("DISABLE_ACCOUNT_DELETION", "false")
+        monkeypatch.setenv("EF_UAT_MODE", "false")
+        monkeypatch.setenv("DISABLE_GRAPH_WRITES", "false")
+        store = MagicMock()
+        store.get_compliance_record.return_value = None
+        record = make_record(offboard_days_ago=20, ef_required=False)
+        from utils.cleanup_scan import _delete_stale
+        with patch("utils.cleanup_scan.delete_user") as mock_del, \
+             patch("utils.cleanup_scan.get_deleted_user", return_value=None), \
+             patch("utils.cleanup_scan.has_email_forwarding", return_value=False), \
+             patch("utils.monitor_accounts.send_no_ef_pre_deletion_notice", return_value=True) as mock_notice:
+            result = _delete_stale(
+                "user-001", record, store, source="tracked_no_ef", days_elapsed=20,
+            )
+        assert result == "deferred_notice"
+        mock_notice.assert_called_once()
+        mock_del.assert_not_called()
+
+    def test_cleanup_deletes_once_notice_lead_met(self, monkeypatch):
+        monkeypatch.delenv("EF_DRY_RUN", raising=False)
+        monkeypatch.setenv("DISABLE_ACCOUNT_DELETION", "false")
+        monkeypatch.setenv("EF_UAT_MODE", "false")
+        monkeypatch.setenv("DISABLE_GRAPH_WRITES", "false")
+        store = MagicMock()
+        record = make_record(
+            offboard_days_ago=20, ef_required=False, pre_deletion_notice_days_ago=6,
+        )
+        from utils.cleanup_scan import _delete_stale
+        with patch("utils.cleanup_scan.delete_user", return_value=True) as mock_del, \
+             patch("utils.cleanup_scan.get_deleted_user", return_value=None), \
+             patch("utils.cleanup_scan.has_email_forwarding", return_value=False):
+            result = _delete_stale(
+                "user-001", record, store, source="tracked_no_ef", days_elapsed=20,
+            )
+        assert result == "deleted"
+        mock_del.assert_called_once_with("user-001")

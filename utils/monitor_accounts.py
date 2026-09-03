@@ -5,13 +5,14 @@ Daily monitoring logic – runs via the Azure Functions timer trigger at 9 AM UT
 
 Decision matrix (days elapsed from offboard date):
 
-  EF Required = NO
-  ┌───────────────────┬─────────────────────────────────────────────────────────────┐
-  │ Any day           │ NO action – IT deletes manually during offboarding.         │
-  │                   │ Monthly cleanup scan (cleanup_scan.py) is the safety net.   │
-  │                   │ Set AUTO_DELETE_NO_EF=true to revert to auto-delete on Day  │
-  │                   │ EF_REMOVE_1 (legacy behaviour).                             │
-  └───────────────────┴─────────────────────────────────────────────────────────────┘
+  EF Required = NO  (policy 4.6.2 – no manager access requested)
+  ┌────────────────────────┬────────────────────────────────────────────────────────┐
+  │ Day NO_EF_NOTICE_DAY   │ PRE-DELETION NOTICE to manager + business owner         │
+  │ Day NO_EF_RETENTION(15)│ DELETE – only once the notice has been sent and the     │
+  │                        │   NO_EF_NOTICE_MIN_LEAD_DAYS lead time has elapsed.     │
+  │                        │   Requires AUTO_DELETE_NO_EF=true; otherwise IT deletes │
+  │                        │   manually and cleanup_scan.py is the safety net.       │
+  └────────────────────────┴────────────────────────────────────────────────────────┘
 
   EF Required = YES  (Workflow B – attribute-based approval)
   ┌────────────────────┬────────────────────────────────────────────────────────────┐
@@ -68,6 +69,7 @@ from .graph_api    import (
     remove_all_licenses,
     get_ticket_ref_attribute,
     set_ticket_ref_attribute,
+    revoke_sign_in_sessions,
 )
 from .email_sender import (
     send_ef_alert,
@@ -76,6 +78,7 @@ from .email_sender import (
     send_deletion_notice,
     send_final_deletion_notice,
     send_it_approval_notification,
+    send_no_ef_pre_deletion_notice,
 )
 from .approval_webhook import generate_approval_urls
 from .automation_flags import is_dry_run, log_active_gates, resolve_ooo_contact
@@ -111,6 +114,15 @@ _ALERT_WINDOW_1 = (_ALERT_DAY_1, _EF_REMOVE_1 - 1)          # e.g. (23, 29)
 _ALERT_WINDOW_2 = (_ALERT_DAY_2, _EF_REMOVE_2 - 1)          # e.g. (53, 59)
 _ALERT_WINDOW_3 = (_ALERT_DAY_3, _DELETE_DAY_3 - 1)         # e.g. (83, 89)
 
+# ── NO_EF retention (policy 4.6.2 – no manager access requested) ───────────
+# Mailboxes with no approved access request are retained for a short window so
+# late business requests can still be raised, then deleted.
+_NO_EF_RETENTION_DAYS = int(os.environ.get("NO_EF_RETENTION_DAYS", "15"))
+# Day the manager / business owner is notified that deletion is approaching.
+_NO_EF_NOTICE_DAY = int(os.environ.get("NO_EF_NOTICE_DAY", "10"))
+# Deletion is blocked until the notice has been out for at least this long.
+_NO_EF_NOTICE_MIN_LEAD_DAYS = int(os.environ.get("NO_EF_NOTICE_MIN_LEAD_DAYS", "3"))
+
 # ── NO_EF auto-delete (default: off – India teams delete manually) ─────────
 _AUTO_DELETE_NO_EF = os.environ.get("AUTO_DELETE_NO_EF", "false").lower() == "true"
 
@@ -134,7 +146,7 @@ _OOO_MAX_DAYS = int(os.environ.get("OOO_MAX_DAYS", "30"))
 _IT_APPROVAL_EMAIL = os.environ.get("IT_APPROVAL_EMAIL", "")
 
 # Days after offboard to send a one-time NO_EF reminder to admins (0 = disabled)
-_NO_EF_ADMIN_REMINDER_DAY = int(os.environ.get("NO_EF_ADMIN_REMINDER_DAY", "28"))
+_NO_EF_ADMIN_REMINDER_DAY = int(os.environ.get("NO_EF_ADMIN_REMINDER_DAY", "10"))
 
 
 # ---------------------------------------------------------------------------
@@ -165,7 +177,7 @@ def run_monitor() -> Dict[str, int]:
     tracked = {r["userId"]: r for r in store.list_active_users()}
 
     summary: Dict[str, int] = {
-        "checked": 0, "alerted": 0, "ef_removed": 0, "deleted": 0,
+        "checked": 0, "alerted": 0, "notified": 0, "ef_removed": 0, "deleted": 0,
         "errors": 0, "skipped": 0, "dry_run": 0,
     }
 
@@ -180,6 +192,8 @@ def run_monitor() -> Dict[str, int]:
             action = _process_user(user, today, store, tracked.get(user_id), None)
             if action == "alerted":
                 summary["alerted"] += 1
+            elif action == "notified":
+                summary["notified"] += 1
             elif action == "ef_removed":
                 summary["ef_removed"] += 1
             elif action == "deleted":
@@ -193,10 +207,10 @@ def run_monitor() -> Dict[str, int]:
             logger.error("Unhandled error for userId=%s: %s", user_id, exc, exc_info=True)
 
     logger.info(
-        "=== EF Monitor complete – checked=%d alerted=%d ef_removed=%d deleted=%d "
-        "errors=%d skipped=%d (consolidated report is weekly Mon + monthly) ===",
-        summary["checked"], summary["alerted"], summary["ef_removed"],
-        summary["deleted"], summary["errors"], summary["skipped"],
+        "=== EF Monitor complete – checked=%d alerted=%d notified=%d ef_removed=%d "
+        "deleted=%d errors=%d skipped=%d (consolidated report is weekly Mon + monthly) ===",
+        summary["checked"], summary["alerted"], summary["notified"],
+        summary["ef_removed"], summary["deleted"], summary["errors"], summary["skipped"],
     )
     return summary
 
@@ -303,14 +317,13 @@ def _process_user(
             pass
 
     # ── 4. NO EF PATH ───────────────────────────────────────────────────────
-    #   India policy: IT deletes NO_EF accounts manually during offboarding.
-    #   The monthly cleanup scan (cleanup_scan.py) is the automated safety net.
-    #   Set AUTO_DELETE_NO_EF=true to revert to immediate auto-delete behaviour.
-    #   Admin notice is via weekly/monthly consolidated report (not per-user email).
+    #   Policy 4.6.2: no manager access requested → retain NO_EF_RETENTION_DAYS
+    #   so late business requests can still be raised, notify the manager and
+    #   business owner before deletion, then delete.
+    #   IT deletes manually during offboarding; the monthly cleanup scan
+    #   (cleanup_scan.py) is the automated safety net unless AUTO_DELETE_NO_EF.
     if not ef_required:
-        if _AUTO_DELETE_NO_EF and days_elapsed >= _EF_REMOVE_1:
-            return _do_delete(user_id, record, "NO_EF", store, ad_user=user)
-        return "no_action"
+        return _process_no_ef(user_id, record, days_elapsed, store, ad_user=user)
 
     # ── 5. HAS EF – Workflow B attribute check (runs before alert/EF-remove/delete) ──
     #   IT sets CSA ExtStatus to EXTEND_TO_30 / EXTEND_TO_60 / EXTENDED_MAX
@@ -378,6 +391,126 @@ def _process_user(
             )
 
     return "no_action"
+
+
+# ---------------------------------------------------------------------------
+# NO_EF retention (policy 4.6.2)
+# ---------------------------------------------------------------------------
+
+def pre_deletion_notice_lead_met(record: Dict[str, Any], today: Optional[date] = None) -> bool:
+    """
+    True when the pre-deletion notice has been sent and the minimum lead time
+    has elapsed, so the mailbox may be deleted.
+
+    Policy 4.6.2 requires IT to notify the manager and business owner *before*
+    deleting a mailbox that had no approved access request.
+    """
+    notice_str = record.get("preDeletionNoticeDate", "")
+    if not notice_str:
+        return False
+    today = today or datetime.now(timezone.utc).date()
+    try:
+        lead_days = (today - date.fromisoformat(notice_str)).days
+    except ValueError:
+        logger.warning(
+            "userId=%s invalid preDeletionNoticeDate '%s' – treating notice as not sent",
+            record.get("userId"), notice_str,
+        )
+        return False
+    return lead_days >= _NO_EF_NOTICE_MIN_LEAD_DAYS
+
+
+def send_no_ef_deletion_notice(
+    record: Dict[str, Any],
+    store: TableStore,
+    days_elapsed: int,
+) -> bool:
+    """
+    Send the one-time pre-deletion notice for a mailbox with no access request.
+
+    Records the notification date on the tracking + compliance rows so the
+    evidence requirement in policy 4.6.2 is satisfied and the notice is not
+    repeated.  Returns True when the notice was sent.
+    """
+    user_id = record.get("userId", "")
+    today_str = datetime.now(timezone.utc).date().isoformat()
+    days_until_delete = max(_NO_EF_RETENTION_DAYS - days_elapsed, 0)
+
+    if is_dry_run():
+        store.append_audit(
+            user_id, "DRY_RUN_WOULD_SEND_PRE_DELETION_NOTICE",
+            f"days_elapsed={days_elapsed} days_until_delete={days_until_delete}",
+        )
+        logger.info("DRY_RUN: would send NO_EF pre-deletion notice for userId=%s", user_id)
+        return False
+
+    ok = send_no_ef_pre_deletion_notice(
+        record,
+        days_until_delete=days_until_delete,
+        retention_days=_NO_EF_RETENTION_DAYS,
+    )
+    store.append_email_log(
+        user_id=user_id,
+        email_type="NO_EF_PRE_DELETE",
+        recipient=record.get("managerEmail", "") or "ADMIN_EMAILS",
+        subject=f"Mailbox scheduled for deletion – {record.get('displayName', '')}",
+        status="SENT" if ok else "FAILED",
+    )
+    if not ok:
+        store.append_audit(
+            user_id, "PRE_DELETION_NOTICE_FAILED",
+            f"days_elapsed={days_elapsed}. Deletion stays blocked until the notice is delivered.",
+        )
+        return False
+
+    record["preDeletionNoticeDate"] = today_str
+    store.upsert_user(record)
+    store.append_audit(
+        user_id, "PRE_DELETION_NOTICE_SENT",
+        f"Manager/business owner notified that the mailbox is deleted at day "
+        f"{_NO_EF_RETENTION_DAYS} (policy 4.6.2). days_elapsed={days_elapsed}.",
+    )
+    _update_compliance_from_record(record, store, preDeletionNoticeDate=today_str)
+    logger.info(
+        "NO_EF pre-deletion notice sent for userId=%s (day %d of %d)",
+        user_id, days_elapsed, _NO_EF_RETENTION_DAYS,
+    )
+    return True
+
+
+def _process_no_ef(
+    user_id: str,
+    record: Dict[str, Any],
+    days_elapsed: int,
+    store: TableStore,
+    ad_user: Optional[Dict[str, Any]] = None,
+) -> str:
+    """
+    NO_EF lifecycle: notify at NO_EF_NOTICE_DAY, delete at NO_EF_RETENTION_DAYS.
+
+    Deletion only runs when AUTO_DELETE_NO_EF is enabled; otherwise IT deletes
+    manually and cleanup_scan.py acts as the safety net.  Either way the mailbox
+    is never deleted before the pre-deletion notice has gone out.
+    """
+    delete_due = _AUTO_DELETE_NO_EF and days_elapsed >= _NO_EF_RETENTION_DAYS
+    notified = False
+
+    if (days_elapsed >= _NO_EF_NOTICE_DAY or delete_due) and not record.get("preDeletionNoticeDate"):
+        notified = send_no_ef_deletion_notice(record, store, days_elapsed)
+
+    if delete_due:
+        if pre_deletion_notice_lead_met(record):
+            return _do_delete(user_id, record, "NO_EF_RETENTION", store, ad_user=ad_user)
+        store.append_audit(
+            user_id, "DELETE_DEFERRED_PENDING_NOTICE",
+            f"Day {days_elapsed}: deletion held until the pre-deletion notice has been "
+            f"out for {_NO_EF_NOTICE_MIN_LEAD_DAYS} day(s) (policy 4.6.2).",
+        )
+        logger.info(
+            "userId=%s NO_EF deletion deferred – awaiting notice lead time", user_id,
+        )
+
+    return "notified" if notified else "no_action"
 
 
 # ---------------------------------------------------------------------------
@@ -771,7 +904,10 @@ def _create_record(
     ef_required       = has_email_forwarding(user_id)
     forwarding_address = get_forwarding_address(user_id) if ef_required else ""
 
-    delete_date = (offboard_date + timedelta(days=30)).isoformat()
+    # Policy 4.6.2: 30 days when manager access (forwarding) is in place,
+    # NO_EF_RETENTION_DAYS when no access was requested.
+    retention_days = _EF_REMOVE_1 if ef_required else _NO_EF_RETENTION_DAYS
+    delete_date = (offboard_date + timedelta(days=retention_days)).isoformat()
 
     usage_location = (user.get("usageLocation") or "").strip().upper()
 
@@ -801,6 +937,8 @@ def _create_record(
         "deletionExempt":      False,
         "noEfAdminNotifiedDate": "",
         "noEfAdminReminderDate": "",
+        "preDeletionNoticeDate": "",
+        "sessionsRevokedDate":  "",
     }
 
     store.upsert_user(record)
@@ -813,12 +951,31 @@ def _create_record(
         "Registered new user userId=%s ef=%s offboard=%s", user_id, ef_required, offboard_date
     )
 
+    # Policy 4.2.2 – revoke active sessions once, at first registration.
+    # The account is already sign-in blocked; this invalidates refresh tokens
+    # so existing sessions and mobile clients cannot keep using the mailbox.
+    try:
+        if revoke_sign_in_sessions(user_id):
+            record["sessionsRevokedDate"] = datetime.now(timezone.utc).date().isoformat()
+            store.upsert_user(record)
+            store.append_audit(
+                user_id, "SESSIONS_REVOKED",
+                "Active sign-in sessions and refresh tokens revoked (policy 4.2.2).",
+            )
+    except Exception as exc:
+        logger.error("Session revocation failed for userId=%s: %s", user_id, exc)
+
     # Set OOO on first registration (internal-only; test mode uses prem_testing as contact)
     try:
         if not is_auto_reply_enabled(user_id):
             mgr_name = manager_obj.get("displayName", "") or manager_email
             ooo_name, ooo_email = resolve_ooo_contact(mgr_name, manager_email)
-            ooo_ok = set_auto_reply(user_id, manager_name=ooo_name, manager_email=ooo_email)
+            ooo_ok = set_auto_reply(
+                user_id,
+                manager_name=ooo_name,
+                manager_email=ooo_email,
+                forwarding_active=ef_required,
+            )
             if ooo_ok:
                 record["oooSetDate"] = offboard_date.isoformat()
                 store.upsert_user(record)
@@ -954,6 +1111,8 @@ def _update_compliance_from_record(record: Dict[str, Any], store: TableStore, **
         "oooSetDate":           record.get("oooSetDate", ""),
         "oooDisabledDate":      record.get("oooDisabledDate", ""),
         "efDisabledDate":       record.get("efDisabledDate", ""),
+        "preDeletionNoticeDate": record.get("preDeletionNoticeDate", ""),
+        "sessionsRevokedDate":  record.get("sessionsRevokedDate", ""),
         "deletedDate":          record.get("deletedDate", ""),
         "licensesRemovedDate":  record.get("licensesRemovedDate", ""),
         "managerEmail":         record.get("managerEmail", ""),

@@ -582,6 +582,21 @@ def enable_email_forwarding(user_id: str, forwarding_address: str) -> bool:
 # Account lifecycle
 # ---------------------------------------------------------------------------
 
+def revoke_sign_in_sessions(user_id: str) -> bool:
+    """
+    Invalidate all refresh tokens / active sessions for a user.
+
+    Policy 4.2.2 requires active sessions to be revoked at deactivation so a
+    departed employee cannot keep using an already-authenticated client.
+    """
+    result = _post(f"{_GRAPH_BASE}/users/{user_id}/revokeSignInSessions")
+    if result is None:
+        logger.error("Failed to revoke sign-in sessions for userId=%s", user_id)
+        return False
+    logger.info("Revoked sign-in sessions for userId=%s", user_id)
+    return True
+
+
 def delete_user(user_id: str) -> bool:
     """
     Soft-delete a user from Azure AD.
@@ -633,18 +648,48 @@ def get_deleted_user(user_id: str) -> Optional[Dict[str, Any]]:
 # Auto-Reply (OOO) management
 # ---------------------------------------------------------------------------
 
-def set_auto_reply(user_id: str, manager_name: str, manager_email: str) -> bool:
+def set_auto_reply(
+    user_id: str,
+    manager_name: str,
+    manager_email: str,
+    forwarding_active: bool = False,
+) -> bool:
     """
     Configure OOO for a terminated user (internal senders only).
 
     externalAudience=none → no auto-reply to external/internet senders
-    (testing and production). Manager is named as the internal point of contact.
+    (testing and production).
+
+    Wording follows policy section 4.2.3.  When forwarding is active the
+    policy's recommended internal text is used and the manager is named so the
+    sender can follow up directly; otherwise the manager is given as the point
+    of contact, since claiming the message was forwarded would be inaccurate.
+
+    The manager is resolved from Entra while the org relationship still exists,
+    which is before the account is deleted, so *manager_email* is normally
+    populated.  If it is not, the wording falls back to a generic form rather
+    than rendering an empty contact.
     """
-    internal_msg = (
-        f"Thank you for your email. This mailbox is no longer monitored as the individual "
-        f"is no longer associated with Netradyne. For business-related matters, please contact "
-        f"{manager_name} at {manager_email}."
-    )
+    contact = f"{manager_name} at {manager_email}" if manager_email else manager_name
+    if forwarding_active:
+        if contact:
+            internal_msg = (
+                f"Thank you for your email. This mailbox is no longer monitored as the individual "
+                f"is no longer associated with Netradyne. Your message has been automatically "
+                f"forwarded to the employee's manager, {contact}, for further review and action."
+            )
+        else:
+            internal_msg = (
+                "Thank you for your email. This mailbox is no longer monitored as the individual "
+                "is no longer associated with Netradyne. Your message has been automatically "
+                "forwarded to the employee's manager for further review and action."
+            )
+    else:
+        internal_msg = (
+            f"Thank you for your email. This mailbox is no longer monitored as the individual "
+            f"is no longer associated with Netradyne. For business-related matters, please contact "
+            f"{contact}."
+        )
     return _patch(
         f"{_GRAPH_BASE}/users/{user_id}/mailboxSettings",
         {

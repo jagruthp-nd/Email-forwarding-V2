@@ -31,6 +31,7 @@ $requiredRoles = @(
     "Mail.Send",                                # Send mail as SENDER_EMAIL via Graph (no SMTP password)
     "Sites.ReadWrite.All"                       # Upload weekly/monthly reports to SharePoint library
     # Note: User.Read.All is covered by User.ReadWrite.All (superset).
+    # revokeSignInSessions (policy 4.2.2) is covered by User.ReadWrite.All.
     # Sites.ReadWrite.All can be narrowed later to Sites.Selected if preferred.
     #
     # ALSO required (Office 365 Exchange Online app, not Microsoft Graph):

@@ -25,7 +25,7 @@ from .table_store import TableStore
 
 logger = logging.getLogger(__name__)
 
-_NO_EF_ADMIN_REMINDER_DAY = int(os.environ.get("NO_EF_ADMIN_REMINDER_DAY", "28"))
+_NO_EF_ADMIN_REMINDER_DAY = int(os.environ.get("NO_EF_ADMIN_REMINDER_DAY", "10"))
 
 
 def _bool(value: Any) -> bool:

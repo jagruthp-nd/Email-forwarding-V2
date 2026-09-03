@@ -17,7 +17,9 @@ Two populations are targeted:
 Configurable env vars:
   CLEANUP_SCHEDULE          NCronTab for the timer trigger (default: monthly on 1st at 06:00 UTC)
   CLEANUP_REGION            Azure AD usageLocation code to filter by (default "IN")
-  CLEANUP_MIN_OFFBOARD_DAYS Minimum days since offboard before cleanup deletes (default 30)
+  CLEANUP_MIN_OFFBOARD_DAYS Minimum days since offboard before cleanup deletes
+                            (default 15 – policy 4.6.2 retention for accounts
+                            with no approved manager access request)
 
 Account safety rules:
   - Already marked DELETED in UserTracking → SKIP
@@ -26,6 +28,8 @@ Account safety rules:
   - Entra CSA EFAutomation.DeleteExempt (truthy) → SKIP
   - Account still has active email forwarding → SKIP (log warning, let daily monitor handle)
   - Account already deleted from Azure AD (soft-deleted / 404) → mark DELETED in tracking, SKIP
+  - Manager / business owner not yet notified of pending deletion → send the
+    notice and DEFER to the next run (policy 4.6.2)
 """
 
 from __future__ import annotations
@@ -45,6 +49,7 @@ from .graph_api   import (
 )
 from .automation_flags import is_account_deletion_disabled, is_dry_run, log_active_gates
 from .deletion_exempt import is_automated_deletion_exempt
+from .monitor_accounts import pre_deletion_notice_lead_met, send_no_ef_deletion_notice
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +58,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _CLEANUP_REGION            = os.environ.get("CLEANUP_REGION",            "IN")
-_CLEANUP_MIN_OFFBOARD_DAYS = int(os.environ.get("CLEANUP_MIN_OFFBOARD_DAYS", "30"))
+_CLEANUP_MIN_OFFBOARD_DAYS = int(os.environ.get("CLEANUP_MIN_OFFBOARD_DAYS", "15"))
 
 
 # ---------------------------------------------------------------------------
@@ -76,7 +81,7 @@ def run_cleanup_scan() -> Dict[str, int]:
 
     summary = {"checked": 0, "deleted": 0, "skipped_already_deleted": 0,
                "skipped_has_ef": 0, "skipped_too_recent": 0, "skipped_exempt": 0,
-               "dry_run": 0, "errors": 0}
+               "deferred_notice": 0, "dry_run": 0, "errors": 0}
 
     # Build a fast lookup of what's already tracked
     all_tracked = {r["userId"]: r for r in store.list_all_users()}
@@ -104,7 +109,9 @@ def run_cleanup_scan() -> Dict[str, int]:
             continue
 
         summary["checked"] += 1
-        result = _delete_stale(user_id, record, store, source="tracked_no_ef")
+        result = _delete_stale(
+            user_id, record, store, source="tracked_no_ef", days_elapsed=days_elapsed,
+        )
         _tally(summary, result)
 
     # ── Population 2: AD accounts not in tracking (slipped past daily monitor) ─
@@ -150,17 +157,18 @@ def run_cleanup_scan() -> Dict[str, int]:
             "managerEmail": "",
         }
         result = _delete_stale(
-            user_id, stub, store, source="untracked_ad_account", ad_user=user,
+            user_id, stub, store, source="untracked_ad_account",
+            days_elapsed=days_elapsed, ad_user=user,
         )
         _tally(summary, result)
 
     logger.info(
-        "=== Cleanup Scan complete – checked=%d deleted=%d "
-        "skip_deleted=%d skip_ef=%d skip_recent=%d skip_exempt=%d dry_run=%d errors=%d ===",
+        "=== Cleanup Scan complete – checked=%d deleted=%d skip_deleted=%d skip_ef=%d "
+        "skip_recent=%d skip_exempt=%d deferred_notice=%d dry_run=%d errors=%d ===",
         summary["checked"],   summary["deleted"],
         summary["skipped_already_deleted"], summary["skipped_has_ef"],
         summary["skipped_too_recent"], summary["skipped_exempt"],
-        summary["dry_run"], summary["errors"],
+        summary["deferred_notice"], summary["dry_run"], summary["errors"],
     )
     return summary
 
@@ -174,12 +182,14 @@ def _delete_stale(
     record: Dict[str, Any],
     store: TableStore,
     source: str,
+    days_elapsed: int = 0,
     ad_user: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Delete one stale account if safe to do so.
 
-    Returns: 'deleted' | 'skipped_already_deleted' | 'skipped_has_ef' | 'skipped_exempt' | 'dry_run' | 'error'
+    Returns: 'deleted' | 'skipped_already_deleted' | 'skipped_has_ef' |
+             'skipped_exempt' | 'deferred_notice' | 'dry_run' | 'error'
     """
     exempt, exempt_reason = is_automated_deletion_exempt(
         user_id,
@@ -237,6 +247,20 @@ def _delete_stale(
         logger.error("userId=%s EF check failed: %s – skipping", user_id, exc)
         return "error"
 
+    # Policy 4.6.2: the manager / business owner must be notified before the
+    # mailbox is deleted. Send the notice now and defer to the next run.
+    if not pre_deletion_notice_lead_met(record):
+        send_no_ef_deletion_notice(record, store, days_elapsed)
+        store.append_audit(
+            user_id, "CLEANUP_DEFERRED_PENDING_NOTICE",
+            f"source={source}. Deletion held until the manager/business owner "
+            f"pre-deletion notice lead time has elapsed (policy 4.6.2).",
+        )
+        logger.info(
+            "Cleanup deferred for userId=%s – pre-deletion notice lead time not met", user_id,
+        )
+        return "deferred_notice"
+
     # Safe to delete
     ok = delete_user(user_id)
     if not ok:
@@ -265,6 +289,8 @@ def _tally(summary: Dict[str, int], result: str) -> None:
         summary["skipped_has_ef"] += 1
     elif result == "skipped_exempt":
         summary["skipped_exempt"] += 1
+    elif result == "deferred_notice":
+        summary["deferred_notice"] += 1
     elif result == "dry_run":
         summary["dry_run"] += 1
     elif result == "error":

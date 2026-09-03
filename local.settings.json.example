@@ -29,6 +29,10 @@
     "AUTO_DELETE_NO_EF":     "false",
     "DELETE_REGION":         "IN",
 
+    "NO_EF_RETENTION_DAYS":       "15",
+    "NO_EF_NOTICE_DAY":           "10",
+    "NO_EF_NOTICE_MIN_LEAD_DAYS": "3",
+
     "SDP_TICKET_URL":        "<servicedesk-extension-request-template-url>",
     "SERVICEDESK_TICKET_URL": "<same-as-SDP_TICKET_URL-preferred-name>",
 
@@ -47,7 +51,7 @@
     "SHAREPOINT_UPLOAD_ENABLED": "true",
     "REPORT_ARCHIVE_FORMAT":     "both",
 
-    "NO_EF_ADMIN_REMINDER_DAY": "28",
+    "NO_EF_ADMIN_REMINDER_DAY": "10",
     "DELETION_EXEMPT_USER_IDS": "",
     "DELETION_EXEMPT_EMAILS":   "",
 
@@ -65,6 +69,6 @@
 
     "CLEANUP_SCHEDULE":          "0 0 6 1 * *",
     "CLEANUP_REGION":            "IN",
-    "CLEANUP_MIN_OFFBOARD_DAYS": "30"
+    "CLEANUP_MIN_OFFBOARD_DAYS": "15"
   }
 }

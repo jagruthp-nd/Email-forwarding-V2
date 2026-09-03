@@ -16,6 +16,7 @@ Email types (Workflow B):
   FINAL_DELETION     – Day 90 max-policy deletion
   WEEKLY_REPORT      – Friday digest to ADMIN_EMAILS
   NO_EF_ADMIN        – Admin notice for accounts without forwarding
+  NO_EF_PRE_DELETE   – Pre-deletion notice before the NO_EF retention deadline
   IT_APPROVAL        – Approve/Decline links for IT
 """
 
@@ -410,7 +411,7 @@ def send_deletion_notice(record: Dict[str, Any], reason: str) -> bool:
     Manager notification after account deletion (Day 30 / 60 paths).
     Managers see plain “deleted” wording; admins get soft-delete detail separately.
 
-    reason values: 'NO_EF', 'NO_EXTENSION_DAY30', 'NO_EXTENSION_DAY60'
+    reason values: 'NO_EF', 'NO_EF_RETENTION', 'NO_EXTENSION_DAY30', 'NO_EXTENSION_DAY60'
     """
     manager_email = record.get("managerEmail", "")
     if not manager_email:
@@ -424,6 +425,11 @@ def send_deletion_notice(record: Dict[str, Any], reason: str) -> bool:
 
     reason_text_map = {
         "NO_EF":              "No email forwarding was configured for this account.",
+        "NO_EF_RETENTION": (
+            "No mailbox access or email forwarding request was received during the "
+            "retention period following departure. A pre-deletion notice was sent "
+            "before this action."
+        ),
         "NO_EXTENSION_DAY30": (
             "No approved extension request was processed before the 30-day deadline. "
             "A ServiceDesk ticket with HR and Infosec approval was required."
@@ -468,6 +474,128 @@ def send_deletion_notice(record: Dict[str, Any], reason: str) -> bool:
     ok = _send(manager_email, subject, html)
     _send_admin_soft_delete_notice(record, reason=reason, max_policy=False)
     return ok
+
+
+def send_no_ef_pre_deletion_notice(
+    record: Dict[str, Any],
+    days_until_delete: int,
+    retention_days: int,
+) -> bool:
+    """
+    Pre-deletion notice for mailboxes with no approved manager access request.
+
+    Policy 4.6.2 requires IT to notify the manager and the relevant business
+    owner *before* deleting a mailbox on the standard retention timeline, and
+    to record that notification in the SD+ ticket.
+
+    Sent to the manager when known; otherwise to ADMIN_EMAILS so the
+    notification obligation is still met and evidenced for untracked accounts.
+    """
+    it_email = get_it_email()
+    manager_email = record.get("managerEmail", "")
+    recipients = [manager_email] if manager_email else list(get_admin_emails())
+    if not recipients:
+        logger.warning(
+            "No manager or admin recipient for userId=%s – pre-deletion notice not sent",
+            record.get("userId"),
+        )
+        return False
+
+    it_contact     = it_email or "IT Operations"
+    sdp_ticket_url = get_servicedesk_ticket_url()
+    employee_name  = record.get("displayName", "the departed employee")
+    employee_mail  = record.get("userEmail", "")
+    offboard_date  = record.get("offboardDate", "")
+    ticket_ref     = record.get("ticketRef", "")
+
+    if sdp_ticket_url:
+        sdp_button = (
+            f'<a href="{sdp_ticket_url}" target="_blank" '
+            'style="display:inline-block;margin-top:12px;padding:10px 20px;'
+            'background:#0078d4;color:#fff;text-decoration:none;'
+            'border-radius:4px;font-weight:bold;">&#128196; Raise access / forwarding request in ServiceDesk</a>'
+        )
+    else:
+        sdp_button = (
+            f'<p style="margin:8px 0 0;">Contact {it_contact} '
+            'to raise a ServiceDesk request.</p>'
+        )
+
+    ticket_row = (
+        '<tr><td style="padding:8px 14px;font-weight:bold;border:1px solid #dee2e6;">SD+ Ticket</td>'
+        f'<td style="padding:8px 14px;border:1px solid #dee2e6;">{ticket_ref}</td></tr>'
+        if ticket_ref else ""
+    )
+
+    subject = (
+        f"[Action Required] Mailbox scheduled for deletion in {days_until_delete} day"
+        f"{'s' if days_until_delete != 1 else ''} – {employee_name}"
+    )
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"></head>
+<body style="font-family:Segoe UI,Arial,sans-serif;color:#333;max-width:640px;margin:auto;padding:20px;">
+
+  <div style="background:#fd7e14;color:#fff;padding:24px;border-radius:6px 6px 0 0;">
+    <h2 style="margin:0;font-size:20px;">&#9888; Mailbox Deletion Notice</h2>
+    <p style="margin:6px 0 0;opacity:.85;font-size:14px;">Netradyne IT Operations</p>
+  </div>
+
+  <div style="background:#f8f9fa;padding:24px;border:1px solid #dee2e6;border-top:none;border-radius:0 0 6px 6px;">
+    <p>Dear Manager / Business Owner,</p>
+
+    <p>No mailbox access or email forwarding request has been received for
+    <strong>{employee_name}</strong> ({employee_mail}) since their departure.
+    Under the Employee Exit Email Management &amp; Access Policy, a mailbox with no
+    approved access request is retained for <strong>{retention_days} days</strong>
+    and then deleted.</p>
+
+    <div style="background:#fff3cd;border:1px solid #ffc107;padding:16px;border-radius:4px;margin:20px 0;">
+      <strong>&#9200; This mailbox will be deleted in {days_until_delete} day{"s" if days_until_delete != 1 else ""}</strong><br>
+      If you need access to the mailbox or email forwarding, raise a request now.
+      Deleted mailboxes can be recovered from Microsoft 365 for up to 30 days after deletion.
+    </div>
+
+    <table style="width:100%;border-collapse:collapse;margin:16px 0;font-size:13px;">
+      <tr style="background:#e9ecef;">
+        <td style="padding:8px 14px;font-weight:bold;width:180px;border:1px solid #dee2e6;">Employee</td>
+        <td style="padding:8px 14px;border:1px solid #dee2e6;">{employee_name}</td>
+      </tr>
+      <tr>
+        <td style="padding:8px 14px;font-weight:bold;border:1px solid #dee2e6;">Email</td>
+        <td style="padding:8px 14px;border:1px solid #dee2e6;">{employee_mail}</td>
+      </tr>
+      <tr style="background:#e9ecef;">
+        <td style="padding:8px 14px;font-weight:bold;border:1px solid #dee2e6;">Last Working Day</td>
+        <td style="padding:8px 14px;border:1px solid #dee2e6;">{offboard_date}</td>
+      </tr>
+      {ticket_row}
+    </table>
+
+    <div style="background:#d1ecf1;border:1px solid #bee5eb;padding:16px;border-radius:4px;margin:20px 0;">
+      <h3 style="margin:0 0 8px;color:#0c5460;">&#x2192; If you still need this mailbox:</h3>
+      <ol style="margin:0;padding-left:20px;line-height:1.8;">
+        <li>Raise a <strong>ServiceDesk (SD+) ticket</strong> with your business justification.</li>
+        <li>Approvals are recorded against the ticket for audit purposes.</li>
+        <li>Approved access is time-bound and must not exceed 90 days from the termination date.</li>
+      </ol>
+      {sdp_button}
+    </div>
+
+    <p style="font-size:13px;color:#888;border-top:1px solid #dee2e6;padding-top:16px;margin-top:24px;">
+      This is an automated message from IT Operations.<br>
+      Questions? Contact {it_contact}
+    </p>
+  </div>
+</body>
+</html>"""
+
+    sent_any = False
+    for addr in recipients:
+        if _send(addr, subject, html, cc_address=it_email or None):
+            sent_any = True
+    return sent_any
 
 
 def send_weekly_report(data: Dict[str, Any], admin_emails: List[str]) -> int:
