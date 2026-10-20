@@ -47,7 +47,7 @@ from __future__ import annotations
 import logging
 import os
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional
 
 from .table_store  import TableStore
 from .graph_api    import (
@@ -58,6 +58,7 @@ from .graph_api    import (
     disable_email_forwarding,
     enable_email_forwarding,
     delete_user,
+    get_deleted_user,
     get_manager,
     is_extension_approved,
     set_extension_attribute,
@@ -66,9 +67,7 @@ from .graph_api    import (
     set_auto_reply,
     disable_auto_reply,
     is_litigation_hold_active,
-    remove_all_licenses,
     get_ticket_ref_attribute,
-    set_ticket_ref_attribute,
     revoke_sign_in_sessions,
 )
 from .email_sender import (
@@ -178,7 +177,7 @@ def run_monitor() -> Dict[str, int]:
 
     summary: Dict[str, int] = {
         "checked": 0, "alerted": 0, "notified": 0, "ef_removed": 0, "deleted": 0,
-        "errors": 0, "skipped": 0, "dry_run": 0,
+        "errors": 0, "skipped": 0, "dry_run": 0, "deleted_externally": 0,
     }
 
     for user in ad_users:
@@ -206,11 +205,31 @@ def run_monitor() -> Dict[str, int]:
             summary["errors"] += 1
             logger.error("Unhandled error for userId=%s: %s", user_id, exc, exc_info=True)
 
+    # Tracked users no longer in the terminated list: if Entra's recycle bin has
+    # them, IT deleted them outside the automation – record it so reports show it.
+    ad_ids = {u.get("id") for u in ad_users}
+    for user_id, record in tracked.items():
+        if user_id in ad_ids:
+            continue
+        try:
+            deleted = get_deleted_user(user_id)
+            if deleted:
+                mark_deleted(
+                    record, store, "MANUAL_OR_EXTERNAL", deleted_by="manual",
+                    deleted_date=(deleted.get("deletedDateTime") or "")[:10] or None,
+                )
+                summary["deleted_externally"] += 1
+        except Exception as exc:
+            summary["errors"] += 1
+            logger.error("Deleted-user check failed for userId=%s: %s", user_id, exc)
+
     logger.info(
         "=== EF Monitor complete – checked=%d alerted=%d notified=%d ef_removed=%d "
-        "deleted=%d errors=%d skipped=%d (consolidated report is weekly Mon + monthly) ===",
+        "deleted=%d deleted_externally=%d errors=%d skipped=%d "
+        "(consolidated report is weekly Mon + monthly) ===",
         summary["checked"], summary["alerted"], summary["notified"],
-        summary["ef_removed"], summary["deleted"], summary["errors"], summary["skipped"],
+        summary["ef_removed"], summary["deleted"], summary["deleted_externally"],
+        summary["errors"], summary["skipped"],
     )
     return summary
 
@@ -277,8 +296,8 @@ def _process_user(
     # Re-detect EF / refresh forwarding target (EXO Admin Center address)
     if not is_new:
         try:
-            has_ef = has_email_forwarding(user_id)
             fwd = get_forwarding_address(user_id) or ""
+            has_ef = bool(fwd) or has_email_forwarding(user_id)
             if has_ef and not _bool(record.get("efRequired", False)):
                 record["efRequired"] = True
                 record["forwardingAddress"] = fwd
@@ -727,29 +746,31 @@ def _do_delete(
         status="SENT",
     )
 
-    # Update tracking record
-    record["statusCode"]  = "DELETED"
-    record["deletedDate"] = today_str
-    store.upsert_user(record)
-
-    # Remove M365 licenses after successful deletion
-    try:
-        remove_all_licenses(user_id)
-        record["licensesRemovedDate"] = today_str
-    except Exception as exc:
-        logger.error("License removal failed for userId=%s: %s", user_id, exc)
-
-    store.append_audit(user_id, "DELETED", f"reason={reason}")
+    # Licenses are released by Entra on delete; /users/{id} 404s afterwards so
+    # an explicit assignLicense call here was a no-op.
+    mark_deleted(record, store, reason, deleted_by="automation", deleted_date=today_str)
     logger.info("Deleted userId=%s reason=%s", user_id, reason)
-
-    _update_compliance_from_record(
-        record, store,
-        deletedDate=today_str,
-        deleteReason=reason,
-        licensesRemovedDate=record.get("licensesRemovedDate", ""),
-    )
-
     return "deleted"
+
+
+def mark_deleted(
+    record: Dict[str, Any],
+    store: TableStore,
+    reason: str,
+    deleted_by: str,
+    deleted_date: Optional[str] = None,
+) -> None:
+    """Persist DELETED state with when/why/who so reports can list deleted accounts.
+
+    deleted_by: 'automation' (daily monitor) | 'cleanup' (monthly scan) | 'manual' (IT, outside automation)
+    """
+    record["statusCode"]   = "DELETED"
+    record["deletedDate"]  = deleted_date or datetime.now(timezone.utc).date().isoformat()
+    record["deleteReason"] = reason
+    record["deletedBy"]    = deleted_by
+    store.upsert_user(record)
+    store.append_audit(record["userId"], "DELETED", f"reason={reason} by={deleted_by}")
+    _update_compliance_from_record(record, store)
 
 
 # ---------------------------------------------------------------------------
@@ -1012,36 +1033,6 @@ def _create_record(
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _collect_overdue_no_ef(store: TableStore, today: date) -> List[Dict[str, Any]]:
-    """NO_EF accounts past NO_EF_ADMIN_REMINDER_DAY still active (for consolidated report)."""
-    if _NO_EF_ADMIN_REMINDER_DAY <= 0:
-        return []
-    overdue: List[Dict[str, Any]] = []
-    for record in store.list_active_users():
-        if _bool(record.get("efRequired", False)):
-            continue
-        if record.get("statusCode") == "DELETED":
-            continue
-        try:
-            offboard = date.fromisoformat(record.get("offboardDate", ""))
-        except ValueError:
-            continue
-        days = (today - offboard).days
-        if days < _NO_EF_ADMIN_REMINDER_DAY:
-            continue
-        overdue.append({
-            "displayName": record.get("displayName", ""),
-            "userEmail": record.get("userEmail", ""),
-            "offboardDate": record.get("offboardDate", ""),
-            "usageLocation": record.get("usageLocation", ""),
-            "managerEmail": record.get("managerEmail", ""),
-            "userId": record.get("userId", ""),
-            "daysElapsed": days,
-        })
-    overdue.sort(key=lambda r: int(r.get("daysElapsed") or 0), reverse=True)
-    return overdue
-
-
 def _bool(value: Any) -> bool:
     """Coerce various truthy representations from Table Storage to bool."""
     if isinstance(value, bool):
@@ -1114,6 +1105,8 @@ def _update_compliance_from_record(record: Dict[str, Any], store: TableStore, **
         "preDeletionNoticeDate": record.get("preDeletionNoticeDate", ""),
         "sessionsRevokedDate":  record.get("sessionsRevokedDate", ""),
         "deletedDate":          record.get("deletedDate", ""),
+        "deleteReason":         record.get("deleteReason", ""),
+        "deletedBy":            record.get("deletedBy", ""),
         "licensesRemovedDate":  record.get("licensesRemovedDate", ""),
         "managerEmail":         record.get("managerEmail", ""),
     }

@@ -15,7 +15,7 @@ from __future__ import annotations
 import csv
 import io
 import os
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
 def get_archive_formats() -> List[str]:
@@ -40,6 +40,7 @@ def build_report_csv(
     new_with_ef: List[Dict[str, Any]],
     overdue_no_ef: List[Dict[str, Any]],
     summary: Dict[str, Any],
+    deleted: Optional[List[Dict[str, Any]]] = None,
 ) -> bytes:
     """Single CSV with Section column for long-term data handling."""
     buf = io.StringIO()
@@ -58,6 +59,10 @@ def build_report_csv(
         "DaysElapsed",
         "Metric",
         "MetricValue",
+        "DeletedDate",
+        "DeletedBy",
+        "DeleteReason",
+        "RecoverableUntil",
     ])
 
     for key, label in (
@@ -86,6 +91,11 @@ def build_report_csv(
         "", "", "", "", "", "", "",
         "OverdueNO_EF_Count", len(overdue_no_ef),
     ])
+    writer.writerow([
+        "Summary", report_date, period_label, period_start,
+        "", "", "", "", "", "", "",
+        "Deleted_Count", len(deleted or []),
+    ])
 
     for r in new_no_ef:
         writer.writerow([
@@ -113,6 +123,16 @@ def build_report_csv(
             _cell(r.get("daysElapsed")), "", "",
         ])
 
+    for r in deleted or []:
+        writer.writerow([
+            "Deleted", report_date, period_label, period_start,
+            _cell(r.get("displayName")), _cell(r.get("userEmail")),
+            _cell(r.get("offboardDate")), _cell(r.get("usageLocation")),
+            _cell(r.get("managerEmail")), "", "", "", "",
+            _cell(r.get("deletedDate")), _cell(r.get("deletedBy")),
+            _cell(r.get("deleteReason")), _cell(r.get("recoverableUntil")),
+        ])
+
     # UTF-8 BOM so Excel opens CSV cleanly
     return ("\ufeff" + buf.getvalue()).encode("utf-8")
 
@@ -126,6 +146,7 @@ def build_report_xlsx(
     new_with_ef: List[Dict[str, Any]],
     overdue_no_ef: List[Dict[str, Any]],
     summary: Dict[str, Any],
+    deleted: Optional[List[Dict[str, Any]]] = None,
 ) -> bytes:
     """Multi-sheet Excel workbook."""
     from openpyxl import Workbook
@@ -141,6 +162,7 @@ def build_report_xlsx(
     ws.append(["New_NO_EF", len(new_no_ef)])
     ws.append(["New_EF", len(new_with_ef)])
     ws.append(["Overdue_NO_EF", len(overdue_no_ef)])
+    ws.append(["Deleted", len(deleted or [])])
     ws.append(["Alerts", summary.get("alerts", summary.get("alerted", ""))])
     ws.append(["Extensions", summary.get("extensions", "")])
     ws.append(["Deletions", summary.get("deletions", summary.get("deleted", ""))])
@@ -179,6 +201,20 @@ def build_report_xlsx(
             r.get("managerEmail", ""), r.get("daysElapsed", ""),
         ])
 
+    ws_del = wb.create_sheet("Deleted")
+    ws_del.append([
+        "DisplayName", "UserEmail", "OffboardDate", "DeletedDate", "DeletedBy",
+        "DeleteReason", "RecoverableUntil", "ManagerEmail", "UsageLocation",
+    ])
+    for r in deleted or []:
+        ws_del.append([
+            r.get("displayName", ""), r.get("userEmail", ""),
+            r.get("offboardDate", ""), r.get("deletedDate", ""),
+            r.get("deletedBy", ""), r.get("deleteReason", ""),
+            r.get("recoverableUntil", ""), r.get("managerEmail", ""),
+            r.get("usageLocation", ""),
+        ])
+
     out = io.BytesIO()
     wb.save(out)
     return out.getvalue()
@@ -193,6 +229,7 @@ def build_report_archives(
     new_with_ef: List[Dict[str, Any]],
     overdue_no_ef: List[Dict[str, Any]],
     summary: Dict[str, Any],
+    deleted: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Tuple[str, bytes, str]]:
     """
     Returns list of (filename, content_bytes, content_type).
@@ -207,6 +244,7 @@ def build_report_archives(
         new_with_ef=new_with_ef,
         overdue_no_ef=overdue_no_ef,
         summary=summary,
+        deleted=deleted or [],
     )
     files: List[Tuple[str, bytes, str]] = []
     for fmt in get_archive_formats():

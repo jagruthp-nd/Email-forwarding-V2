@@ -7,6 +7,7 @@ Builds a consolidated report covering:
   - Newly tracked NO_EF accounts in the period
   - Newly tracked EF accounts (forwarding target + manager)
   - Overdue NO_EF accounts
+  - Accounts deleted in the period (automation, monthly cleanup, or manually by IT)
   - Activity counts (alerts, extensions, deletions)
 
 SharePoint folder link is included when SHAREPOINT_* settings are set.
@@ -26,6 +27,7 @@ from .table_store import TableStore
 logger = logging.getLogger(__name__)
 
 _NO_EF_ADMIN_REMINDER_DAY = int(os.environ.get("NO_EF_ADMIN_REMINDER_DAY", "10"))
+_RECOVERY_GRACE_DAYS = int(os.environ.get("RECOVERY_GRACE_DAYS", "30"))
 
 
 def _bool(value: Any) -> bool:
@@ -50,6 +52,22 @@ def _user_row(u: Dict[str, Any], *, days_elapsed: Any = None) -> Dict[str, Any]:
     }
     if days_elapsed is not None:
         row["daysElapsed"] = days_elapsed
+    return row
+
+
+def _deleted_row(u: Dict[str, Any]) -> Dict[str, Any]:
+    row = _user_row(u)
+    deleted = u.get("deletedDate", "")
+    try:
+        recoverable = (date.fromisoformat(deleted) + timedelta(days=_RECOVERY_GRACE_DAYS)).isoformat()
+    except ValueError:
+        recoverable = ""
+    row.update({
+        "deletedDate": deleted,
+        "deleteReason": u.get("deleteReason", ""),
+        "deletedBy": u.get("deletedBy", ""),
+        "recoverableUntil": recoverable,
+    })
     return row
 
 
@@ -97,9 +115,15 @@ def _collect_period_data(store: TableStore, lookback_days: int) -> Dict[str, Any
                 overdue.append(_user_row(u, days_elapsed=days))
         overdue.sort(key=lambda r: int(r.get("daysElapsed") or 0), reverse=True)
 
+    deleted = sorted(
+        (_deleted_row(u) for u in all_users.values()
+         if u.get("statusCode") == "DELETED" and (u.get("deletedDate") or "") >= period_start),
+        key=lambda r: r["deletedDate"],
+        reverse=True,
+    )
+
     alerts = sum(1 for a in recent if (a.get("action") or "") in ("ALERTED", "ALERT_SENT", "FINAL_ALERT"))
     extensions = sum(1 for a in recent if str(a.get("action", "")).startswith("EXTENDED"))
-    deletions = sum(1 for a in recent if (a.get("action") or "") == "DELETED")
     active = sum(1 for u in all_users.values() if u.get("statusCode") != "DELETED")
 
     return {
@@ -108,10 +132,11 @@ def _collect_period_data(store: TableStore, lookback_days: int) -> Dict[str, Any
         "new_no_ef": new_no_ef,
         "new_with_ef": new_with_ef,
         "overdue_no_ef": overdue,
+        "deleted": deleted,
         "summary": {
             "alerts": alerts,
             "extensions": extensions,
-            "deletions": deletions,
+            "deletions": len(deleted),
             "total_active": active,
         },
     }
@@ -159,6 +184,7 @@ def archive_period_report(
         new_no_ef=data["new_no_ef"],
         new_with_ef=data["new_with_ef"],
         overdue_no_ef=data["overdue_no_ef"],
+        deleted=data["deleted"],
         summary=data["summary"],
     )
     uploaded = []
@@ -203,6 +229,7 @@ def _send_period_report(period_label: str, lookback_days: int) -> Dict[str, Any]
         new_no_ef=data["new_no_ef"],
         new_with_ef=data["new_with_ef"],
         overdue_no_ef=data["overdue_no_ef"],
+        deleted=data["deleted"],
         summary=data["summary"],
         period_label=period_label,
         period_start=data["period_start"],
@@ -238,7 +265,3 @@ def run_monthly_report() -> Dict[str, Any]:
     """Monthly report (default lookback 31 days)."""
     return _send_period_report("Monthly", lookback_days=31)
 
-
-def run_archive_report(lookback_days: int = 7) -> Dict[str, Any]:
-    """Immediate SharePoint archive (no email)."""
-    return archive_period_report("OnDemand", lookback_days=lookback_days)

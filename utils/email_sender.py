@@ -415,6 +415,8 @@ def send_deletion_notice(record: Dict[str, Any], reason: str) -> bool:
     """
     manager_email = record.get("managerEmail", "")
     if not manager_email:
+        # admin soft-delete notice still goes out when no manager is on file
+        _send_admin_soft_delete_notice(record, reason=reason, max_policy=False)
         return False
 
     it_email      = get_it_email()
@@ -598,191 +600,6 @@ def send_no_ef_pre_deletion_notice(
     return sent_any
 
 
-def send_weekly_report(data: Dict[str, Any], admin_emails: List[str]) -> int:
-    """
-    Send the weekly EF Automation summary digest to all admin recipients.
-
-    Parameters
-    ----------
-    data         : Report data dict produced by weekly_report.generate_weekly_report()
-    admin_emails : List of admin email addresses (from ADMIN_EMAILS env var)
-
-    Returns the number of successfully delivered emails.
-    """
-    if not admin_emails:
-        return 0
-
-    report_date   = data.get("report_date", "")
-    period_start  = data.get("report_period_start", "")
-    total_active  = data.get("total_active", 0)
-    total_deleted = data.get("total_deleted_ever", 0)
-    upcoming      = data.get("upcoming_deadlines", [])
-    extensions    = data.get("extensions_this_week", [])
-    deletions     = data.get("deletions_this_week", [])
-    alerts        = data.get("alerts_this_week", [])
-    status_counts = data.get("status_counts", {})
-
-    subject = f"[EF Automation] Weekly Report – {report_date}"
-
-    # ── Status breakdown rows ─────────────────────────────────────────────
-    status_label = {
-        "MONITORING":    "Monitoring (no alert yet)",
-        "ALERT_SENT":    "Alert sent – awaiting ticket",
-        "EXTENDED":      "Extended (1st extension active)",
-        "EXTENDED_MAX":  "Extended (max – final period)",
-        "DELETED":       "Deleted",
-    }
-    _zebra = ' style="background:#f8f9fa"'  # pre-computed to avoid backslash-in-fstring (Py 3.8)
-    status_rows_html = "".join(
-        '<tr' + ('' if i % 2 else _zebra) + '>'
-        '<td style="padding:8px 14px;border:1px solid #dee2e6;">'
-        + status_label.get(code, code)
-        + '</td><td style="padding:8px 14px;border:1px solid #dee2e6;text-align:center;">'
-        '<strong>' + str(count) + '</strong></td></tr>'
-        for i, (code, count) in enumerate(sorted(status_counts.items()))
-    )
-
-    # ── Upcoming deadline rows ────────────────────────────────────────────
-    if upcoming:
-        _urgent_style = 'color:#dc3545;font-weight:bold;'
-        upcoming_row_parts = []
-        for i, u in enumerate(upcoming):
-            deadline_style = _urgent_style if u["daysLeft"] <= 3 else ""
-            upcoming_row_parts.append(
-                '<tr' + ('' if i % 2 else _zebra) + '>'
-                '<td style="padding:8px 14px;border:1px solid #dee2e6;">' + u["name"] + '</td>'
-                '<td style="padding:8px 14px;border:1px solid #dee2e6;">' + u["email"] + '</td>'
-                '<td style="padding:8px 14px;border:1px solid #dee2e6;' + deadline_style + '">'
-                + u["deleteDate"] + ' (' + str(u["daysLeft"]) + 'd)</td></tr>'
-            )
-        upcoming_rows = "".join(upcoming_row_parts)
-        upcoming_section = (
-            '<h3 style="color:#dc3545;margin:24px 0 8px;">&#9888; Upcoming Deadlines (next 14 days) &ndash; '
-            + str(len(upcoming))
-            + '</h3><table style="width:100%;border-collapse:collapse;font-size:13px;">'
-            '<tr style="background:#dc3545;color:#fff;">'
-            '<th style="padding:8px 14px;text-align:left;">Employee</th>'
-            '<th style="padding:8px 14px;text-align:left;">Email</th>'
-            '<th style="padding:8px 14px;text-align:left;">Deadline</th>'
-            '</tr>' + upcoming_rows + '</table>'
-        )
-    else:
-        upcoming_section = (
-            '<p style="color:#28a745;">&#10003; No accounts expiring in the next 14 days.</p>'
-        )
-
-    # ── Activity rows helper ──────────────────────────────────────────────
-    def _audit_rows(items: List[Dict[str, Any]]) -> str:
-        if not items:
-            return "<tr><td colspan='3' style='padding:8px 14px;color:#888;'>None this week</td></tr>"
-        parts = []
-        for i, r in enumerate(items):
-            ts = (r.get("executedAt") or "")[:19].replace("T", " ")
-            parts.append(
-                '<tr' + ('' if i % 2 else _zebra) + '>'
-                '<td style="padding:8px 14px;border:1px solid #dee2e6;">'
-                + r.get("PartitionKey", "")
-                + '</td><td style="padding:8px 14px;border:1px solid #dee2e6;">'
-                + r.get("action", "")
-                + '</td><td style="padding:8px 14px;border:1px solid #dee2e6;">'
-                + ts + '</td></tr>'
-            )
-        return "".join(parts)
-
-    activity_table_header = (
-        '<tr style="background:#495057;color:#fff;">'
-        '<th style="padding:8px 14px;text-align:left;">User ID</th>'
-        '<th style="padding:8px 14px;text-align:left;">Action</th>'
-        '<th style="padding:8px 14px;text-align:left;">Time (UTC)</th></tr>'
-    )
-
-    html = f"""<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="UTF-8"></head>
-<body style="font-family:Segoe UI,Arial,sans-serif;color:#333;max-width:780px;margin:auto;padding:20px;">
-
-  <div style="background:#0078d4;color:#fff;padding:24px;border-radius:6px 6px 0 0;">
-    <h2 style="margin:0;font-size:20px;">📊 EF Automation – Weekly Report</h2>
-    <p style="margin:6px 0 0;opacity:.85;font-size:14px;">
-      Period: {period_start} → {report_date} &nbsp;|&nbsp; Netradyne IT Operations
-    </p>
-  </div>
-
-  <div style="background:#f8f9fa;padding:24px;border:1px solid #dee2e6;border-top:none;border-radius:0 0 6px 6px;">
-
-    <!-- Summary cards -->
-    <table style="width:100%;border-collapse:separate;border-spacing:10px;margin-bottom:8px;">
-      <tr>
-        <td style="background:#0078d4;color:#fff;padding:16px;border-radius:6px;text-align:center;width:25%;">
-          <div style="font-size:28px;font-weight:bold;">{total_active}</div>
-          <div style="font-size:12px;opacity:.85;">Active EF Accounts</div>
-        </td>
-        <td style="background:#fd7e14;color:#fff;padding:16px;border-radius:6px;text-align:center;width:25%;">
-          <div style="font-size:28px;font-weight:bold;">{len(upcoming)}</div>
-          <div style="font-size:12px;opacity:.85;">Deadlines in 14 days</div>
-        </td>
-        <td style="background:#28a745;color:#fff;padding:16px;border-radius:6px;text-align:center;width:25%;">
-          <div style="font-size:28px;font-weight:bold;">{len(extensions)}</div>
-          <div style="font-size:12px;opacity:.85;">Extensions this week</div>
-        </td>
-        <td style="background:#6c757d;color:#fff;padding:16px;border-radius:6px;text-align:center;width:25%;">
-          <div style="font-size:28px;font-weight:bold;">{len(deletions)}</div>
-          <div style="font-size:12px;opacity:.85;">Deletions this week</div>
-        </td>
-      </tr>
-    </table>
-
-    <!-- Status breakdown -->
-    <h3 style="margin:24px 0 8px;">Account Status Breakdown</h3>
-    <table style="width:100%;border-collapse:collapse;font-size:13px;">
-      <tr style="background:#495057;color:#fff;">
-        <th style="padding:8px 14px;text-align:left;">Status</th>
-        <th style="padding:8px 14px;text-align:center;">Count</th>
-      </tr>
-      {status_rows_html}
-    </table>
-
-    <!-- Upcoming deadlines -->
-    {upcoming_section}
-
-    <!-- Extensions this week -->
-    <h3 style="margin:24px 0 8px;">Extensions Applied This Week – {len(extensions)}</h3>
-    <table style="width:100%;border-collapse:collapse;font-size:13px;">
-      {activity_table_header}
-      {_audit_rows(extensions)}
-    </table>
-
-    <!-- Deletions this week -->
-    <h3 style="margin:24px 0 8px;">Accounts Deleted This Week – {len(deletions)}</h3>
-    <table style="width:100%;border-collapse:collapse;font-size:13px;">
-      {activity_table_header}
-      {_audit_rows(deletions)}
-    </table>
-
-    <!-- Alerts this week -->
-    <h3 style="margin:24px 0 8px;">Alert Emails Sent This Week – {len(alerts)}</h3>
-    <table style="width:100%;border-collapse:collapse;font-size:13px;">
-      {activity_table_header}
-      {_audit_rows(alerts)}
-    </table>
-
-    <p style="font-size:12px;color:#888;border-top:1px solid #dee2e6;padding-top:16px;margin-top:24px;">
-      This is an automated weekly digest from EF Automation.<br>
-      To add or remove report recipients, update the <strong>ADMIN_EMAILS</strong>
-      application setting (comma-separated) in the Azure Function App configuration.
-    </p>
-  </div>
-</body>
-</html>"""
-
-    sent = 0
-    for admin in admin_emails:
-        if _send(admin, subject, html):
-            sent += 1
-    logger.info("Weekly report sent to %d/%d admins", sent, len(admin_emails))
-    return sent
-
-
 def send_it_approval_notification(
     record: Dict[str, Any],
     approve_url: str,
@@ -898,6 +715,7 @@ def send_offboard_consolidated_report(
     summary: Optional[Dict[str, Any]] = None,
     period_label: str = "Weekly",
     period_start: str = "",
+    deleted: Optional[List[Dict[str, Any]]] = None,
 ) -> int:
     """
     Consolidated weekly/monthly report for IT / team mailbox (REPORT_EMAILS).
@@ -911,6 +729,7 @@ def send_offboard_consolidated_report(
         return 0
 
     summary = summary or {}
+    deleted = deleted or []
     sp_marker = "<!--SP_ARCHIVE_BLOCK-->"
 
     def _rows_no_ef(records: List[Dict[str, Any]], with_days: bool = False) -> str:
@@ -950,10 +769,22 @@ def send_offboard_consolidated_report(
             )
         return "".join(parts)
 
+    def _rows_deleted(records: List[Dict[str, Any]]) -> str:
+        if not records:
+            return '<tr><td colspan="7" style="padding:10px;color:#666;">None</td></tr>'
+        cell = "<td style='padding:8px;border:1px solid #dee2e6;'>{}</td>"
+        return "".join(
+            "<tr>" + "".join(cell.format(r.get(k, "") or "—") for k in (
+                "displayName", "userEmail", "offboardDate", "deletedDate",
+                "deletedBy", "deleteReason", "recoverableUntil",
+            )) + "</tr>"
+            for r in records
+        )
+
     period_line = f"{period_start} → {report_date}" if period_start else report_date
     subject = (
         f"[EF Automation] {period_label} offboard report – {report_date} "
-        f"(new NO_EF: {len(new_no_ef)}, new EF: {len(new_with_ef)}, overdue NO_EF: {len(overdue_no_ef)})"
+        f"(new NO_EF: {len(new_no_ef)}, new EF: {len(new_with_ef)}, overdue NO_EF: {len(overdue_no_ef)}, deleted: {len(deleted)})"
     )
 
     html = f"""<!DOCTYPE html>
@@ -1016,6 +847,23 @@ def send_offboard_consolidated_report(
       {_rows_no_ef(overdue_no_ef, with_days=True)}
     </table>
 
+    <h3 style="margin:18px 0 8px;font-size:15px;">Accounts deleted this period ({len(deleted)})</h3>
+    <p style="font-size:13px;color:#666;margin-top:0;">Deleted by: <strong>automation</strong> (daily job),
+    <strong>cleanup</strong> (monthly safety net) or <strong>manual</strong> (IT, detected from the Entra recycle bin).
+    Restore is possible until the "Recoverable until" date.</p>
+    <table style="width:100%;border-collapse:collapse;font-size:12px;">
+      <tr style="background:#e9ecef;">
+        <th style="padding:8px;border:1px solid #dee2e6;text-align:left;">Name</th>
+        <th style="padding:8px;border:1px solid #dee2e6;text-align:left;">Email</th>
+        <th style="padding:8px;border:1px solid #dee2e6;text-align:left;">Offboard</th>
+        <th style="padding:8px;border:1px solid #dee2e6;text-align:left;">Deleted on</th>
+        <th style="padding:8px;border:1px solid #dee2e6;text-align:left;">Deleted by</th>
+        <th style="padding:8px;border:1px solid #dee2e6;text-align:left;">Reason</th>
+        <th style="padding:8px;border:1px solid #dee2e6;text-align:left;">Recoverable until</th>
+      </tr>
+      {_rows_deleted(deleted)}
+    </table>
+
     <p style="font-size:12px;color:#888;border-top:1px solid #dee2e6;padding-top:14px;margin-top:24px;">
       Recipients: <strong>REPORT_EMAILS</strong> (fallback ADMIN_EMAILS).<br>
       Deletions by this automation are <strong>soft-delete</strong> (Entra recycle bin; Microsoft
@@ -1039,6 +887,7 @@ def send_offboard_consolidated_report(
         new_with_ef=new_with_ef,
         overdue_no_ef=overdue_no_ef,
         summary=summary,
+        deleted=deleted,
     )
     uploaded: List[Dict[str, Any]] = []
     last_err = ""
@@ -1097,12 +946,6 @@ def send_offboard_consolidated_report(
     return sent
 
 
-def send_no_ef_admin_notice(*args: Any, **kwargs: Any) -> int:
-    """Deprecated – use send_offboard_consolidated_report. Kept for import compatibility."""
-    logger.warning("send_no_ef_admin_notice is deprecated; consolidated report is used instead")
-    return 0
-
-
 def send_final_deletion_notice(record: Dict[str, Any]) -> bool:
     """
     Manager notice for Day 90 max-policy deletion (plain “deleted” wording).
@@ -1110,6 +953,7 @@ def send_final_deletion_notice(record: Dict[str, Any]) -> bool:
     """
     manager_email = record.get("managerEmail", "")
     if not manager_email:
+        _send_admin_soft_delete_notice(record, reason="MAX_POLICY_DAY90", max_policy=True)
         return False
 
     it_email      = get_it_email()

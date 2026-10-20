@@ -25,7 +25,7 @@ Write-Host "Microsoft Graph Service Principal ID: $($GraphSp.ObjectId)" -Foregro
 # Define required permissions
 $requiredRoles = @(
     "Directory.Read.All",                       # Read terminated users from Azure AD
-    "User.ReadWrite.All",                       # Delete user accounts + remove licenses (POST /users/{id}/assignLicense)
+    "User.ReadWrite.All",                       # Delete user accounts (licenses are released by Entra on delete)
     "MailboxSettings.ReadWrite",                # Read/update mailbox forwarding + OOO settings
     "CustomSecAttributeAssignment.ReadWrite.All", # Read/write Custom Security Attributes (Workflow B)
     "Mail.Send",                                # Send mail as SENDER_EMAIL via Graph (no SMTP password)
@@ -123,9 +123,8 @@ Write-Host "    When set yes/true, daily monitor + monthly cleanup will NOT soft
 Write-Host "    even without EF or litigation hold. Set back to no when deletion is OK." -ForegroundColor Yellow
 Write-Host "    No Function App config changes needed per user." -ForegroundColor Yellow
 Write-Host "" -ForegroundColor Yellow
-Write-Host "  Step 5 – License removal (User.ReadWrite.All covers this):" -ForegroundColor Yellow
-Write-Host "    POST /users/{id}/assignLicense is used to strip M365 licenses post-deletion." -ForegroundColor Yellow
-Write-Host "    No additional permission beyond User.ReadWrite.All is required." -ForegroundColor Yellow
+Write-Host "  Step 5 – Licenses: released by Entra when the account is soft-deleted." -ForegroundColor Yellow
+Write-Host "    Deleted-user tracking reads /directory/deletedItems (User.Read.All covers this)." -ForegroundColor Yellow
 Write-Host "" -ForegroundColor Yellow
 Write-Host "  Step 6 – Litigation hold check (Graph beta):" -ForegroundColor Yellow
 Write-Host "    GET /beta/users/{id}?`$select=inPlaceHolds requires User.Read.All," -ForegroundColor Yellow

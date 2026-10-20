@@ -36,8 +36,8 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from datetime import date, datetime, timezone
+from typing import Any, Dict, Optional
 
 from .table_store import TableStore
 from .graph_api   import (
@@ -49,7 +49,8 @@ from .graph_api   import (
 )
 from .automation_flags import is_account_deletion_disabled, is_dry_run, log_active_gates
 from .deletion_exempt import is_automated_deletion_exempt
-from .monitor_accounts import pre_deletion_notice_lead_met, send_no_ef_deletion_notice
+from .email_sender import send_deletion_notice
+from .monitor_accounts import mark_deleted, pre_deletion_notice_lead_met, send_no_ef_deletion_notice
 
 logger = logging.getLogger(__name__)
 
@@ -226,12 +227,13 @@ def _delete_stale(
         return "skipped_uat"
 
     # Check if account is already soft-deleted in Azure AD
-    if get_deleted_user(user_id) is not None:
+    deleted = get_deleted_user(user_id)
+    if deleted is not None:
         logger.info("userId=%s already in recycle bin – marking DELETED in tracking", user_id)
-        record["statusCode"] = "DELETED"
-        record["deletedDate"] = datetime.now(timezone.utc).date().isoformat()
-        store.upsert_user(record)
-        store.append_audit(user_id, "DELETED", f"cleanup_scan: already soft-deleted in AD (source={source})")
+        mark_deleted(
+            record, store, "MANUAL_OR_EXTERNAL", deleted_by="manual",
+            deleted_date=(deleted.get("deletedDateTime") or "")[:10] or None,
+        )
         return "skipped_already_deleted"
 
     # Safety check: skip if active EF forwarding found
@@ -268,14 +270,8 @@ def _delete_stale(
         logger.error("Cleanup delete failed for userId=%s (source=%s)", user_id, source)
         return "error"
 
-    today_str = datetime.now(timezone.utc).date().isoformat()
-    record["statusCode"]  = "DELETED"
-    record["deletedDate"] = today_str
-    store.upsert_user(record)
-    store.append_audit(
-        user_id, "DELETED",
-        f"cleanup_scan: stale NO_EF account deleted (source={source}, region={_CLEANUP_REGION})",
-    )
+    mark_deleted(record, store, "NO_EF_RETENTION", deleted_by="cleanup")
+    send_deletion_notice(record, reason="NO_EF_RETENTION")
     logger.info("Cleanup: deleted stale account userId=%s (source=%s)", user_id, source)
     return "deleted"
 

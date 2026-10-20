@@ -178,7 +178,27 @@ def _run_report() -> List[str]:
             "forwardingAddress": "manager.fwd@netradyne.com",
         }],
         overdue_no_ef=[],
-        summary={"alerts": 1, "extensions": 0, "deletions": 0, "total_active": 12},
+        deleted=[
+            {
+                "displayName": "Demo Deleted (automation)",
+                "userEmail": "demo.deleted1@netradyne.com",
+                "offboardDate": (today - timedelta(days=46)).isoformat(),
+                "deletedDate": (today - timedelta(days=1)).isoformat(),
+                "deletedBy": "automation",
+                "deleteReason": "NO_EXTENSION_DAY30",
+                "recoverableUntil": (today + timedelta(days=29)).isoformat(),
+            },
+            {
+                "displayName": "Demo Deleted (manual by IT)",
+                "userEmail": "demo.deleted2@netradyne.com",
+                "offboardDate": (today - timedelta(days=12)).isoformat(),
+                "deletedDate": (today - timedelta(days=3)).isoformat(),
+                "deletedBy": "manual",
+                "deleteReason": "MANUAL_OR_EXTERNAL",
+                "recoverableUntil": (today + timedelta(days=27)).isoformat(),
+            },
+        ],
+        summary={"alerts": 1, "extensions": 0, "deletions": 2, "total_active": 12},
         period_label="Weekly",
         period_start=(today - timedelta(days=7)).isoformat(),
     )

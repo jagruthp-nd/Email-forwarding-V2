@@ -208,8 +208,7 @@ class TestMonitorDecisionLogic:
             ma._AUTO_DELETE_NO_EF = True
             with patch("utils.monitor_accounts.delete_user", return_value=True) as mock_del, \
                  patch("utils.monitor_accounts.send_deletion_notice"), \
-                 patch("utils.monitor_accounts.is_litigation_hold_active", return_value=False), \
-                 patch("utils.monitor_accounts.remove_all_licenses", return_value=True):
+                 patch("utils.monitor_accounts.is_litigation_hold_active", return_value=False):
                 ad = make_ad_user(15)
                 result = self._run(ad, today, store, record)
                 assert result == "deleted"
@@ -308,8 +307,7 @@ class TestMonitorDecisionLogic:
         today = date.today()
         with patch("utils.monitor_accounts.delete_user", return_value=True) as mock_del, \
              patch("utils.monitor_accounts.send_deletion_notice"), \
-             patch("utils.monitor_accounts.is_litigation_hold_active", return_value=False), \
-             patch("utils.monitor_accounts.remove_all_licenses", return_value=True):
+             patch("utils.monitor_accounts.is_litigation_hold_active", return_value=False):
             ad = make_ad_user(46)
             result = self._run(ad, today, store, record)
         assert result == "deleted"
@@ -357,8 +355,7 @@ class TestMonitorDecisionLogic:
         today = date.today()
         with patch("utils.monitor_accounts.delete_user", return_value=True) as mock_del, \
              patch("utils.monitor_accounts.send_deletion_notice"), \
-             patch("utils.monitor_accounts.is_litigation_hold_active", return_value=False), \
-             patch("utils.monitor_accounts.remove_all_licenses", return_value=True):
+             patch("utils.monitor_accounts.is_litigation_hold_active", return_value=False):
             ad = make_ad_user(76)
             result = self._run(ad, today, store, record)
         assert result == "deleted"
@@ -382,8 +379,7 @@ class TestMonitorDecisionLogic:
         today = date.today()
         with patch("utils.monitor_accounts.delete_user", return_value=True) as mock_del, \
              patch("utils.monitor_accounts.send_final_deletion_notice"), \
-             patch("utils.monitor_accounts.is_litigation_hold_active", return_value=False), \
-             patch("utils.monitor_accounts.remove_all_licenses", return_value=True):
+             patch("utils.monitor_accounts.is_litigation_hold_active", return_value=False):
             ad = make_ad_user(90)
             result = self._run(ad, today, store, record)
         assert result == "deleted"
@@ -858,9 +854,77 @@ class TestCleanupPreDeletionNotice:
         from utils.cleanup_scan import _delete_stale
         with patch("utils.cleanup_scan.delete_user", return_value=True) as mock_del, \
              patch("utils.cleanup_scan.get_deleted_user", return_value=None), \
-             patch("utils.cleanup_scan.has_email_forwarding", return_value=False):
+             patch("utils.cleanup_scan.has_email_forwarding", return_value=False), \
+             patch("utils.cleanup_scan.send_deletion_notice") as mock_notice:
             result = _delete_stale(
                 "user-001", record, store, source="tracked_no_ef", days_elapsed=20,
             )
         assert result == "deleted"
         mock_del.assert_called_once_with("user-001")
+        mock_notice.assert_called_once_with(record, reason="NO_EF_RETENTION")
+        assert record["statusCode"] == "DELETED"
+        assert record["deletedBy"] == "cleanup"
+
+
+# ---------------------------------------------------------------------------
+# Tests: deleted-user tracking + reporting
+# ---------------------------------------------------------------------------
+
+class TestDeletedUserTracking:
+    def _run_monitor(self, records, deleted_lookup):
+        store = MagicMock()
+        store.list_active_users.return_value = records
+        store.get_compliance_record.return_value = None
+        from utils.monitor_accounts import run_monitor
+        with patch("utils.monitor_accounts.TableStore", return_value=store), \
+             patch("utils.monitor_accounts.get_terminated_users", return_value=[]), \
+             patch("utils.monitor_accounts.get_deleted_user", side_effect=deleted_lookup):
+            return run_monitor(), store
+
+    def test_manual_deletion_detected_from_recycle_bin(self):
+        record = make_record(offboard_days_ago=12, ef_required=False)
+        summary, store = self._run_monitor(
+            [record], lambda uid: {"id": uid, "deletedDateTime": "2026-10-18T10:00:00Z"},
+        )
+        assert summary["deleted_externally"] == 1
+        assert record["statusCode"] == "DELETED"
+        assert record["deletedBy"] == "manual"
+        assert record["deletedDate"] == "2026-10-18"
+        store.upsert_user.assert_called_with(record)
+
+    def test_missing_user_not_in_recycle_bin_left_alone(self):
+        record = make_record(offboard_days_ago=12, ef_required=False)
+        summary, store = self._run_monitor([record], lambda uid: None)
+        assert summary["deleted_externally"] == 0
+        assert record["statusCode"] == "ACTIVE"
+        store.upsert_user.assert_not_called()
+
+    def test_period_report_lists_deleted_in_window_only(self):
+        today = date.today()
+        recent = make_record("u-recent", offboard_days_ago=50, status="DELETED")
+        recent.update(deletedDate=(today - timedelta(days=2)).isoformat(),
+                      deleteReason="NO_EXTENSION_DAY30", deletedBy="automation")
+        old = make_record("u-old", offboard_days_ago=90, status="DELETED")
+        old["deletedDate"] = (today - timedelta(days=40)).isoformat()
+        store = MagicMock()
+        store.list_all_users.return_value = [recent, old]
+        store.list_recent_audits.return_value = []
+        from utils.weekly_report import _collect_period_data
+        data = _collect_period_data(store, lookback_days=7)
+        assert [r["userId"] for r in data["deleted"]] == ["u-recent"]
+        row = data["deleted"][0]
+        assert row["deletedBy"] == "automation"
+        assert row["recoverableUntil"] == (today + timedelta(days=28)).isoformat()
+        assert data["summary"]["deletions"] == 1
+
+    def test_report_export_includes_deleted_section(self):
+        from utils.report_export import build_report_csv
+        csv_bytes = build_report_csv(
+            report_date="2026-10-20", period_label="Weekly", period_start="2026-10-13",
+            new_no_ef=[], new_with_ef=[], overdue_no_ef=[], summary={},
+            deleted=[{"displayName": "D", "userEmail": "d@x.com", "deletedDate": "2026-10-18",
+                      "deletedBy": "manual", "deleteReason": "MANUAL_OR_EXTERNAL",
+                      "recoverableUntil": "2026-11-17"}],
+        )
+        assert b"Deleted,2026-10-20" in csv_bytes
+        assert b"2026-11-17" in csv_bytes

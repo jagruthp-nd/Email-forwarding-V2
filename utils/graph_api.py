@@ -769,32 +769,3 @@ def is_litigation_hold_active(user_id: str) -> bool:
             logger.info("userId=%s has %d in-place hold(s) – deletion blocked", user_id, len(holds))
             return True
     return False
-
-
-# ---------------------------------------------------------------------------
-# License removal
-# ---------------------------------------------------------------------------
-
-def get_assigned_license_skus(user_id: str) -> List[str]:
-    """Return list of skuId strings for all assigned licenses."""
-    data = _get(f"{_GRAPH_BASE}/users/{user_id}?$select=assignedLicenses")
-    if data:
-        return [lic.get("skuId", "") for lic in data.get("assignedLicenses", []) if lic.get("skuId")]
-    return []
-
-
-def remove_all_licenses(user_id: str) -> bool:
-    """Remove all M365 licenses from the user. Call after account deletion."""
-    skus = get_assigned_license_skus(user_id)
-    if not skus:
-        logger.info("userId=%s has no licenses to remove", user_id)
-        return True
-    result = _post(
-        f"{_GRAPH_BASE}/users/{user_id}/assignLicense",
-        {"addLicenses": [], "removeLicenses": skus},
-    )
-    if result is not None:
-        logger.info("Removed %d license(s) from userId=%s: %s", len(skus), user_id, skus)
-        return True
-    logger.error("Failed to remove licenses from userId=%s", user_id)
-    return False
