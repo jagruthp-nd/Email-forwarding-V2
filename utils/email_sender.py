@@ -772,11 +772,21 @@ def send_offboard_consolidated_report(
     def _rows_deleted(records: List[Dict[str, Any]]) -> str:
         if not records:
             return '<tr><td colspan="7" style="padding:10px;color:#666;">None</td></tr>'
+        # Readable reasons for the email; Excel/CSV keep the raw codes for filtering.
+        labels = {
+            "NO_EF_RETENTION": "No forwarding – retention period ended",
+            "NO_EXTENSION_DAY30": "Forwarding ended Day 30 – no extension",
+            "NO_EXTENSION_DAY60": "Forwarding ended Day 60 – no 2nd extension",
+            "MAX_POLICY_DAY90": "90-day maximum reached",
+            "MANUAL_OR_EXTERNAL": "Deleted by IT outside the automation",
+        }
         cell = "<td style='padding:8px;border:1px solid #dee2e6;'>{}</td>"
         return "".join(
-            "<tr>" + "".join(cell.format(r.get(k, "") or "—") for k in (
-                "displayName", "userEmail", "offboardDate", "deletedDate",
-                "deletedBy", "deleteReason", "recoverableUntil",
+            "<tr>" + "".join(cell.format(v or "—") for v in (
+                r.get("displayName"), r.get("userEmail"), r.get("offboardDate"),
+                r.get("deletedDate"), r.get("deletedBy"),
+                labels.get(r.get("deleteReason", ""), r.get("deleteReason")),
+                r.get("recoverableUntil"),
             )) + "</tr>"
             for r in records
         )

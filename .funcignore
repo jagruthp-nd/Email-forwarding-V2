@@ -1,1 +1,13 @@
 .venv
+.git*
+.vscode
+__pycache__
+local.settings.json
+local.settings.json.example
+tests
+infra
+assets
+stakeholder-review
+*.md
+*.txt
+!requirements.txt
