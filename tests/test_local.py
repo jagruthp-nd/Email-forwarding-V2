@@ -76,7 +76,6 @@ def make_record(
         "ticketRef":           "",
         "legalHoldChecked":    "",
         "legalHoldActive":     False,
-        "licensesRemovedDate": "",
         "preDeletionNoticeDate": notice_date,
         "sessionsRevokedDate": "",
     }
@@ -862,6 +861,7 @@ class TestCleanupPreDeletionNotice:
         assert result == "deleted"
         mock_del.assert_called_once_with("user-001")
         mock_notice.assert_called_once_with(record, reason="NO_EF_RETENTION")
+        assert store.append_email_log.call_args.kwargs["email_type"] == "DELETION_NOTICE"
         assert record["statusCode"] == "DELETED"
         assert record["deletedBy"] == "cleanup"
 
@@ -908,7 +908,8 @@ class TestDeletedUserTracking:
         old["deletedDate"] = (today - timedelta(days=40)).isoformat()
         store = MagicMock()
         store.list_all_users.return_value = [recent, old]
-        store.list_recent_audits.return_value = []
+        # only u-recent has a DELETED audit row inside the window
+        store.list_recent_audits.return_value = [{"PartitionKey": "u-recent", "action": "DELETED"}]
         from utils.weekly_report import _collect_period_data
         data = _collect_period_data(store, lookback_days=7)
         assert [r["userId"] for r in data["deleted"]] == ["u-recent"]

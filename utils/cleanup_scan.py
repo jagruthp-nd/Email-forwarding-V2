@@ -271,7 +271,14 @@ def _delete_stale(
         return "error"
 
     mark_deleted(record, store, "NO_EF_RETENTION", deleted_by="cleanup")
-    send_deletion_notice(record, reason="NO_EF_RETENTION")
+    sent = send_deletion_notice(record, reason="NO_EF_RETENTION")
+    store.append_email_log(
+        user_id=user_id,
+        email_type="DELETION_NOTICE",
+        recipient=record.get("managerEmail", ""),
+        subject=f"Account Deleted – {record.get('displayName', '')}",
+        status="SENT" if sent else "NOT_SENT",
+    )
     logger.info("Cleanup: deleted stale account userId=%s (source=%s)", user_id, source)
     return "deleted"
 

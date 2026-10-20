@@ -954,7 +954,6 @@ def _create_record(
         "ticketRef":           "",
         "legalHoldChecked":    "",
         "legalHoldActive":     False,
-        "licensesRemovedDate": "",
         "deletionExempt":      False,
         "noEfAdminNotifiedDate": "",
         "noEfAdminReminderDate": "",
@@ -1107,7 +1106,6 @@ def _update_compliance_from_record(record: Dict[str, Any], store: TableStore, **
         "deletedDate":          record.get("deletedDate", ""),
         "deleteReason":         record.get("deleteReason", ""),
         "deletedBy":            record.get("deletedBy", ""),
-        "licensesRemovedDate":  record.get("licensesRemovedDate", ""),
         "managerEmail":         record.get("managerEmail", ""),
     }
     # Apply existing values then overrides

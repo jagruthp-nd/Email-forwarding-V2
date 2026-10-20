@@ -1,0 +1,2 @@
+Go live: set EF_UAT_MODE=false, DISABLE_ACCOUNT_DELETION=false and EF_TEST_MODE=false. 
+Leave AUTO_DELETE_NO_EF as it is unless you want the daily job to delete no-forwarding accounts.

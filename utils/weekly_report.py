@@ -115,9 +115,11 @@ def _collect_period_data(store: TableStore, lookback_days: int) -> Dict[str, Any
                 overdue.append(_user_row(u, days_elapsed=days))
         overdue.sort(key=lambda r: int(r.get("daysElapsed") or 0), reverse=True)
 
+    # Selected by audit timestamp (like registrations), not deletedDate: a manual
+    # delete is recorded a day later with an earlier Entra date.
+    deleted_ids = {a.get("PartitionKey") for a in recent if (a.get("action") or "") == "DELETED"}
     deleted = sorted(
-        (_deleted_row(u) for u in all_users.values()
-         if u.get("statusCode") == "DELETED" and (u.get("deletedDate") or "") >= period_start),
+        (_deleted_row(all_users[uid]) for uid in deleted_ids if uid in all_users),
         key=lambda r: r["deletedDate"],
         reverse=True,
     )
