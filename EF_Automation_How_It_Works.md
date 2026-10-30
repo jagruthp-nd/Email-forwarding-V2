@@ -59,20 +59,24 @@ Days in this document are counted from that offboard date (Day 0 = last working 
 As soon as a matching account appears, the automation records them and does three one-time actions:
 
 1. **Revokes active sign-in sessions** so leftover Outlook / mobile sessions cannot keep using the mailbox.
-2. **Turns on an internal-only auto-reply** (external senders do not get a reply).
+2. **Turns on an internal-only auto-reply** (external senders do not get a reply). It also shows as the person's Teams status note. **If the person already set their own out-of-office** (for example "contact A for X, B for Y"), it is left exactly as written and is never switched off by the automation.
 3. **Checks whether email forwarding is already on** the mailbox and chooses one of the two paths below.
 
-The auto-reply stays on for **30 days**, then is turned off.
+The automation's auto-reply stays on for **30 days**, then is turned off. A person's own auto-reply is never turned off.
 
 ### Auto-reply wording
 
-**If forwarding is on**
+**If forwarding is on, to the manager**
 
-> Thank you for your email. This mailbox is no longer monitored as the individual is no longer associated with Netradyne. Your message has been automatically forwarded to the employee's manager, *Name at email*, for further review and action.
+> Thank you for your message. *Name* is no longer with Netradyne, and this mailbox is no longer monitored. Your email has been automatically forwarded to their manager. For any follow-up, please reach out to *Manager (email)*.
+
+**If forwarding is on, to someone other than the manager**
+
+> Thank you for your message. *Name* is no longer with Netradyne, and this mailbox is no longer monitored. Your email has been automatically forwarded. For any follow-up, please reach out to *forwarding recipient's email*.
 
 **If forwarding is not on**
 
-> Thank you for your email. This mailbox is no longer monitored as the individual is no longer associated with Netradyne. For business-related matters, please contact *Name at email*.
+> Thank you for your message. *Name* is no longer with Netradyne, and this mailbox is no longer monitored. For business-related matters, please reach out to *Manager (email)*.
 
 The manager is read from Entra while the manager relationship still exists, which is before the account is deleted.
 
@@ -210,7 +214,7 @@ Any one of these stops an automated delete:
 | Rule | Why |
 |---|---|
 | Usage location is not India | Non-India accounts are out of scope; IT handles them. |
-| Litigation / in-place hold is on | Legal must manage the mailbox. |
+| Litigation Hold or eDiscovery hold is on (read from Exchange) | Legal must manage the mailbox. Reminders and the forwarding timeline still run as normal; forwarding is turned off on schedule (Day 90 at the latest), but the account is **never deleted**. If the hold can't be read, the account is treated as held. |
 | Entra flag `EFAutomation.DeleteExempt` is set | Operational hold (investigation, dispute, special case). |
 | The person is on an IT exemption list | Same idea, maintained by IT. |
 | Pre-deletion notice has not been sent, or the 3-day lead has not passed | Policy 4.6.2 — no silent deletion of no-access mailboxes. |
@@ -225,13 +229,13 @@ Those accounts stay in the reports so they are not forgotten.
 
 | Email | Who receives it | When |
 |---|---|---|
-| Forwarding expiration alert | Manager, IT copied | Days 23, 53, and (final) 83 |
+| Forwarding expiration alert | Manager **and the forwarding recipient** (if not the manager), IT copied | Days 23, 53, and (final) 83 |
 | IT Approve / Decline | IT approval mailbox | Same time as each alert |
-| Forwarding disabled | Manager, IT copied | Day 30 or 60, if no extension |
-| Extension confirmed | Manager, IT copied | After IT records an approved extension |
+| Forwarding disabled | Manager and forwarding recipient, IT copied | Day 30 or 60, if no extension |
+| Extension confirmed | Manager and forwarding recipient, IT copied | After IT records an approved extension |
 | Pre-deletion notice (no forwarding) | Manager, or IT admins if no manager | Day 10 (or earlier if deletion is already due) |
-| Account deleted | Manager, IT copied | When the account is removed |
-| Final deletion (90-day cap) | Manager, IT copied | Day 90 |
+| Account deleted | Manager and forwarding recipient, IT copied | When the account is removed |
+| Final deletion (90-day cap) | Manager and forwarding recipient, IT copied | Day 90 |
 | Weekly offboard report | Report mailbox | Every Monday |
 | Monthly offboard report | Report mailbox | 1st of the month |
 

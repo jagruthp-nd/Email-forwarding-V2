@@ -653,43 +653,33 @@ def set_auto_reply(
     manager_name: str,
     manager_email: str,
     forwarding_active: bool = False,
+    forwarding_address: str = "",
+    employee_name: str = "",
 ) -> bool:
     """
-    Configure OOO for a terminated user (internal senders only).
+    Configure OOO for a terminated user (internal senders only; also shown as the Teams status note).
 
-    externalAudience=none → no auto-reply to external/internet senders
-    (testing and production).
-
-    Wording follows policy section 4.2.3.  When forwarding is active the
-    policy's recommended internal text is used and the manager is named so the
-    sender can follow up directly; otherwise the manager is given as the point
-    of contact, since claiming the message was forwarded would be inaccurate.
-
-    The manager is resolved from Entra while the org relationship still exists,
-    which is before the account is deleted, so *manager_email* is normally
-    populated.  If it is not, the wording falls back to a generic form rather
-    than rendering an empty contact.
+    externalAudience=none → no auto-reply to external/internet senders.
+    When mail is forwarded to someone other than the manager, that person's
+    email is given as the contact; otherwise the manager is. With no contact
+    known the message stays generic rather than rendering an empty name.
     """
-    contact = f"{manager_name} at {manager_email}" if manager_email else manager_name
-    if forwarding_active:
-        if contact:
-            internal_msg = (
-                f"Thank you for your email. This mailbox is no longer monitored as the individual "
-                f"is no longer associated with Netradyne. Your message has been automatically "
-                f"forwarded to the employee's manager, {contact}, for further review and action."
-            )
-        else:
-            internal_msg = (
-                "Thank you for your email. This mailbox is no longer monitored as the individual "
-                "is no longer associated with Netradyne. Your message has been automatically "
-                "forwarded to the employee's manager for further review and action."
-            )
-    else:
-        internal_msg = (
-            f"Thank you for your email. This mailbox is no longer monitored as the individual "
-            f"is no longer associated with Netradyne. For business-related matters, please contact "
-            f"{contact}."
+    who = employee_name or "This colleague"
+    msg = f"Thank you for your message. {who} is no longer with Netradyne, and this mailbox is no longer monitored."
+    mgr = (
+        f"{manager_name} ({manager_email})" if manager_name and manager_email and manager_name != manager_email
+        else manager_email or manager_name
+    )
+    fwd = forwarding_address if forwarding_address.lower() != (manager_email or "").lower() else ""
+    if forwarding_active and fwd:
+        msg += f" Your email has been automatically forwarded. For any follow-up, please reach out to {fwd}."
+    elif forwarding_active:
+        msg += " Your email has been automatically forwarded to their manager" + (
+            f". For any follow-up, please reach out to {mgr}." if mgr else " for review."
         )
+    elif mgr:
+        msg += f" For business-related matters, please reach out to {mgr}."
+    internal_msg = msg
     return _patch(
         f"{_GRAPH_BASE}/users/{user_id}/mailboxSettings",
         {
@@ -711,13 +701,13 @@ def disable_auto_reply(user_id: str) -> bool:
     )
 
 
-def is_auto_reply_enabled(user_id: str) -> bool:
-    """Return True if OOO is currently active (alwaysEnabled or scheduled)."""
+def is_auto_reply_enabled(user_id: str) -> Optional[bool]:
+    """True if OOO is active (alwaysEnabled or scheduled), False if off, None if it couldn't be read."""
     settings = _get(f"{_GRAPH_BASE}/users/{user_id}/mailboxSettings")
-    if settings:
-        status = (settings.get("automaticRepliesSetting") or {}).get("status", "disabled")
-        return status in ("alwaysEnabled", "scheduled")
-    return False
+    if settings is None:
+        return None
+    status = (settings.get("automaticRepliesSetting") or {}).get("status", "disabled")
+    return status in ("alwaysEnabled", "scheduled")
 
 
 # ---------------------------------------------------------------------------
@@ -758,14 +748,13 @@ def set_ticket_ref_attribute(user_id: str, ticket_ref: str) -> bool:
 
 def is_litigation_hold_active(user_id: str) -> bool:
     """
-    Check if a user has an active litigation / in-place hold via the beta endpoint.
-    Returns True if any InPlaceHolds are set on the user mailbox.
-    Requires User.Read.All (or AuditLog.Read.All) on the app registration.
+    True when the mailbox is on Litigation Hold or an eDiscovery hold (via EXO Admin API).
+
+    Graph has no hold field (beta silently ignores $select=inPlaceHolds), so this
+    reads Exchange. Raises when the hold state can't be read – callers fail closed.
     """
-    data = _get(f"{_GRAPH_BETA}/users/{user_id}?$select=inPlaceHolds")
-    if data:
-        holds = data.get("inPlaceHolds") or []
-        if holds:
-            logger.info("userId=%s has %d in-place hold(s) – deletion blocked", user_id, len(holds))
-            return True
-    return False
+    from .exchange_admin import is_mailbox_on_legal_hold
+    held = is_mailbox_on_legal_hold(user_id)
+    if held:
+        logger.info("userId=%s is on legal hold – deletion blocked", user_id)
+    return held

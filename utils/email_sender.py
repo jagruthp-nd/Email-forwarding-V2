@@ -78,6 +78,24 @@ def _send(
     )
 
 
+def _ef_recipients(record: Dict[str, Any]) -> List[str]:
+    """Manager, plus the forwarding recipient when mail is forwarded to someone else."""
+    out: List[str] = []
+    for addr in (record.get("managerEmail", ""), record.get("forwardingAddress", "")):
+        if addr and addr.lower() not in [a.lower() for a in out]:
+            out.append(addr)
+    return out
+
+
+def _send_to_all(recipients: List[str], subject: str, html_body: str, cc_address: Optional[str] = None) -> bool:
+    """Send one copy per recipient; IT is CC'd only once (on the first)."""
+    sent = False
+    for i, addr in enumerate(recipients):
+        if _send(addr, subject, html_body, cc_address=cc_address if i == 0 else None):
+            sent = True
+    return sent
+
+
 # ---------------------------------------------------------------------------
 # Public email functions (one per email type)
 # ---------------------------------------------------------------------------
@@ -92,9 +110,9 @@ def send_ef_alert(record: Dict[str, Any], days_remaining: int, is_final: bool = 
     days_remaining : How many days until the account is deleted
     is_final       : True when this is the Day-ALERT_DAY_3 final warning (max policy)
     """
-    manager_email = record.get("managerEmail", "")
-    if not manager_email:
-        logger.warning("No manager email for userId=%s – skipping alert", record.get("userId"))
+    recipients = _ef_recipients(record)
+    if not recipients:
+        logger.warning("No manager or forwarding email for userId=%s – skipping alert", record.get("userId"))
         return False
 
     it_email       = get_it_email()
@@ -147,7 +165,7 @@ def send_ef_alert(record: Dict[str, Any], days_remaining: int, is_final: bool = 
 
   <div style="background:#f8f9fa;padding:24px;border:1px solid #dee2e6;border-top:none;border-radius:0 0 6px 6px;">
 
-    <p>Dear Manager,</p>
+    <p>Hello,</p>
 
     {urgency_banner}
 
@@ -201,7 +219,7 @@ def send_ef_alert(record: Dict[str, Any], days_remaining: int, is_final: bool = 
 </body>
 </html>"""
 
-    return _send(manager_email, subject, html, cc_address=it_email or None)
+    return _send_to_all(recipients, subject, html, cc_address=it_email or None)
 
 
 def send_ef_removed_notice(record: Dict[str, Any], days_until_delete: int, reason: str) -> bool:
@@ -212,8 +230,8 @@ def send_ef_removed_notice(record: Dict[str, Any], days_until_delete: int, reaso
     The account is NOT deleted yet.  There are still *days_until_delete* days
     for IT to process a late approval (DELETE_DAY_1 / DELETE_DAY_2 thresholds).
     """
-    manager_email = record.get("managerEmail", "")
-    if not manager_email:
+    recipients = _ef_recipients(record)
+    if not recipients:
         return False
 
     it_email       = get_it_email()
@@ -254,7 +272,7 @@ def send_ef_removed_notice(record: Dict[str, Any], days_until_delete: int, reaso
   </div>
 
   <div style="background:#f8f9fa;padding:24px;border:1px solid #dee2e6;border-top:none;border-radius:0 0 6px 6px;">
-    <p>Dear Manager,</p>
+    <p>Hello,</p>
     <p>Email forwarding for <strong>{employee_name}</strong> ({employee_mail}) has been
     <strong>disabled</strong> because {reason_text}.</p>
 
@@ -297,15 +315,15 @@ def send_ef_removed_notice(record: Dict[str, Any], days_until_delete: int, reaso
 </body>
 </html>"""
 
-    return _send(manager_email, subject, html, cc_address=it_email or None)
+    return _send_to_all(recipients, subject, html, cc_address=it_email or None)
 
 
 def send_extension_confirm(record: Dict[str, Any]) -> bool:
     """
     Confirmation email sent to manager after an extension is approved.
     """
-    manager_email = record.get("managerEmail", "")
-    if not manager_email:
+    recipients = _ef_recipients(record)
+    if not recipients:
         return False
 
     it_email      = get_it_email()
@@ -329,7 +347,7 @@ def send_extension_confirm(record: Dict[str, Any]) -> bool:
   </div>
 
   <div style="background:#f8f9fa;padding:24px;border:1px solid #dee2e6;border-top:none;border-radius:0 0 6px 6px;">
-    <p>Dear Manager,</p>
+    <p>Hello,</p>
     <p>Your ServiceDesk extension request for <strong>{employee_name}</strong> has been
     approved by HR and Infosec, and the extension has been applied by IT.</p>
 
@@ -354,7 +372,7 @@ def send_extension_confirm(record: Dict[str, Any]) -> bool:
 </body>
 </html>"""
 
-    return _send(manager_email, subject, html, cc_address=it_email or None)
+    return _send_to_all(recipients, subject, html, cc_address=it_email or None)
 
 
 def _send_admin_soft_delete_notice(
@@ -413,8 +431,8 @@ def send_deletion_notice(record: Dict[str, Any], reason: str) -> bool:
 
     reason values: 'NO_EF', 'NO_EF_RETENTION', 'NO_EXTENSION_DAY30', 'NO_EXTENSION_DAY60'
     """
-    manager_email = record.get("managerEmail", "")
-    if not manager_email:
+    recipients = _ef_recipients(record)
+    if not recipients:
         # admin soft-delete notice still goes out when no manager is on file
         _send_admin_soft_delete_notice(record, reason=reason, max_policy=False)
         return False
@@ -456,7 +474,7 @@ def send_deletion_notice(record: Dict[str, Any], reason: str) -> bool:
   </div>
 
   <div style="background:#f8f9fa;padding:24px;border:1px solid #dee2e6;border-top:none;border-radius:0 0 6px 6px;">
-    <p>Dear Manager,</p>
+    <p>Hello,</p>
     <p>The Azure AD account for <strong>{employee_name}</strong> ({employee_mail}) has been
     <strong>deleted</strong> on <strong>{deleted_date}</strong>.</p>
 
@@ -473,7 +491,7 @@ def send_deletion_notice(record: Dict[str, Any], reason: str) -> bool:
 </body>
 </html>"""
 
-    ok = _send(manager_email, subject, html)
+    ok = _send_to_all(recipients, subject, html)
     _send_admin_soft_delete_notice(record, reason=reason, max_policy=False)
     return ok
 
@@ -961,8 +979,8 @@ def send_final_deletion_notice(record: Dict[str, Any]) -> bool:
     Manager notice for Day 90 max-policy deletion (plain “deleted” wording).
     Admins get soft-delete technical detail in a separate email.
     """
-    manager_email = record.get("managerEmail", "")
-    if not manager_email:
+    recipients = _ef_recipients(record)
+    if not recipients:
         _send_admin_soft_delete_notice(record, reason="MAX_POLICY_DAY90", max_policy=True)
         return False
 
@@ -985,7 +1003,7 @@ def send_final_deletion_notice(record: Dict[str, Any]) -> bool:
   </div>
 
   <div style="background:#f8f9fa;padding:24px;border:1px solid #dee2e6;border-top:none;border-radius:0 0 6px 6px;">
-    <p>Dear Manager,</p>
+    <p>Hello,</p>
 
     <p>The Azure AD account for <strong>{employee_name}</strong> ({employee_mail}) has been
     <strong>deleted</strong> on <strong>{deleted_date}</strong> as per the company's
@@ -1005,6 +1023,6 @@ def send_final_deletion_notice(record: Dict[str, Any]) -> bool:
 </body>
 </html>"""
 
-    ok = _send(manager_email, subject, html)
+    ok = _send_to_all(recipients, subject, html)
     _send_admin_soft_delete_notice(record, reason="MAX_POLICY_DAY90", max_policy=True)
     return ok

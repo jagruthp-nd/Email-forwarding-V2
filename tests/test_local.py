@@ -37,6 +37,13 @@ import pytest
 # Helpers / stubs
 # ---------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def _no_legal_hold():
+    """Legal-hold lookups hit Exchange; default to 'not held' unless a test overrides it."""
+    with patch("utils.graph_api.is_litigation_hold_active", return_value=False):
+        yield
+
+
 def make_record(
     user_id: str = "user-001",
     offboard_days_ago: int = 0,
@@ -206,8 +213,7 @@ class TestMonitorDecisionLogic:
         try:
             ma._AUTO_DELETE_NO_EF = True
             with patch("utils.monitor_accounts.delete_user", return_value=True) as mock_del, \
-                 patch("utils.monitor_accounts.send_deletion_notice"), \
-                 patch("utils.monitor_accounts.is_litigation_hold_active", return_value=False):
+                 patch("utils.monitor_accounts.send_deletion_notice"):
                 ad = make_ad_user(15)
                 result = self._run(ad, today, store, record)
                 assert result == "deleted"
@@ -305,8 +311,7 @@ class TestMonitorDecisionLogic:
         record = make_record(offboard_days_ago=46, ef_required=True, extension_count=0, status="EF_DISABLED")
         today = date.today()
         with patch("utils.monitor_accounts.delete_user", return_value=True) as mock_del, \
-             patch("utils.monitor_accounts.send_deletion_notice"), \
-             patch("utils.monitor_accounts.is_litigation_hold_active", return_value=False):
+             patch("utils.monitor_accounts.send_deletion_notice"):
             ad = make_ad_user(46)
             result = self._run(ad, today, store, record)
         assert result == "deleted"
@@ -353,8 +358,7 @@ class TestMonitorDecisionLogic:
         record = make_record(offboard_days_ago=76, ef_required=True, extension_count=1, status="EF_DISABLED")
         today = date.today()
         with patch("utils.monitor_accounts.delete_user", return_value=True) as mock_del, \
-             patch("utils.monitor_accounts.send_deletion_notice"), \
-             patch("utils.monitor_accounts.is_litigation_hold_active", return_value=False):
+             patch("utils.monitor_accounts.send_deletion_notice"):
             ad = make_ad_user(76)
             result = self._run(ad, today, store, record)
         assert result == "deleted"
@@ -377,8 +381,7 @@ class TestMonitorDecisionLogic:
         record = make_record(offboard_days_ago=90, ef_required=True, extension_count=2, status="EXTENDED_MAX")
         today = date.today()
         with patch("utils.monitor_accounts.delete_user", return_value=True) as mock_del, \
-             patch("utils.monitor_accounts.send_final_deletion_notice"), \
-             patch("utils.monitor_accounts.is_litigation_hold_active", return_value=False):
+             patch("utils.monitor_accounts.send_final_deletion_notice"):
             ad = make_ad_user(90)
             result = self._run(ad, today, store, record)
         assert result == "deleted"
@@ -803,8 +806,8 @@ class TestDeletionExemptAndDryRun:
         assert ok is True
         msg = mock_patch.call_args[0][1]["automaticRepliesSetting"]["internalReplyMessage"]
         assert "no longer monitored" in msg
-        assert "automatically forwarded to the employee's manager" in msg
-        assert "Mgr Name at mgr@netradyne.com" in msg
+        assert "automatically forwarded to their manager" in msg
+        assert "please reach out to Mgr Name (mgr@netradyne.com)" in msg
 
     def test_ooo_omits_contact_when_manager_unknown(self):
         """No manager on the Entra record → generic wording, no dangling contact."""
@@ -812,8 +815,8 @@ class TestDeletionExemptAndDryRun:
             from utils.graph_api import set_auto_reply
             set_auto_reply("uid", "", "", forwarding_active=True)
         msg = mock_patch.call_args[0][1]["automaticRepliesSetting"]["internalReplyMessage"]
-        assert msg.endswith("for further review and action.")
-        assert "manager," not in msg
+        assert msg.endswith("forwarded to their manager for review.")
+        assert "reach out to" not in msg
 
 
 # ---------------------------------------------------------------------------
@@ -929,3 +932,77 @@ class TestDeletedUserTracking:
         )
         assert b"Deleted,2026-10-20" in csv_bytes
         assert b"2026-11-17" in csv_bytes
+
+
+# ---------------------------------------------------------------------------
+# Tests: manager review feedback (legal hold, forwarding recipient, user OOO)
+# ---------------------------------------------------------------------------
+
+class TestManagerFeedback:
+    def test_ooo_names_forwarding_recipient_when_not_manager(self):
+        with patch("utils.graph_api._patch", return_value=True) as mock_patch:
+            from utils.graph_api import set_auto_reply
+            set_auto_reply("uid", "Mgr Name", "mgr@netradyne.com", forwarding_active=True,
+                           forwarding_address="peer@netradyne.com", employee_name="Asha Rao")
+        msg = mock_patch.call_args[0][1]["automaticRepliesSetting"]["internalReplyMessage"]
+        assert msg.startswith("Thank you for your message. Asha Rao is no longer with Netradyne")
+        assert "please reach out to peer@netradyne.com" in msg
+        assert "mgr@netradyne.com" not in msg
+
+    def test_users_own_ooo_is_preserved_and_never_scheduled_off(self):
+        from utils.monitor_accounts import _ensure_ooo
+        store = MagicMock()
+        record = make_record(ef_required=False)
+        with patch("utils.monitor_accounts.is_auto_reply_enabled", return_value=True), \
+             patch("utils.monitor_accounts.set_auto_reply") as mock_set:
+            _ensure_ooo("user-001", record, store)
+        mock_set.assert_not_called()
+        assert record["oooPreserved"] is True
+        assert record["oooSetDate"] == ""   # Day-30 disable keys off oooSetDate
+
+    def test_unreadable_ooo_state_never_overwrites(self):
+        from utils.monitor_accounts import _ensure_ooo
+        record = make_record(ef_required=False)
+        with patch("utils.monitor_accounts.is_auto_reply_enabled", return_value=None), \
+             patch("utils.monitor_accounts.set_auto_reply") as mock_set:
+            _ensure_ooo("user-001", record, MagicMock())
+        mock_set.assert_not_called()
+        assert not record.get("oooPreserved") and record["oooSetDate"] == ""
+
+    def test_legal_hold_day90_ends_forwarding_but_keeps_account(self, monkeypatch):
+        monkeypatch.setenv("EF_UAT_MODE", "false")
+        monkeypatch.setenv("DISABLE_ACCOUNT_DELETION", "false")
+        monkeypatch.setenv("DISABLE_GRAPH_WRITES", "false")
+        monkeypatch.delenv("EF_DRY_RUN", raising=False)
+        store = MagicMock()
+        store.get_compliance_record.return_value = None
+        record = make_record(offboard_days_ago=90, extension_count=2)
+        with patch("utils.graph_api.is_litigation_hold_active", return_value=True), \
+             patch("utils.monitor_accounts.delete_user") as mock_del, \
+             patch("utils.monitor_accounts.disable_email_forwarding", return_value=True) as mock_off, \
+             patch("utils.monitor_accounts.send_final_deletion_notice") as mock_mail:
+            from utils.monitor_accounts import _do_delete
+            result = _do_delete("user-001", record, "MAX_POLICY_DAY90", store, is_final=True,
+                                ad_user={"customSecurityAttributes": {}})
+        assert result == "no_action"
+        mock_del.assert_not_called()
+        mock_mail.assert_not_called()
+        mock_off.assert_called_once_with("user-001")
+        assert record["statusCode"] == "EF_DISABLED" and record["legalHoldActive"] is True
+
+    def test_legal_hold_lookup_error_fails_closed(self):
+        from utils.deletion_exempt import is_automated_deletion_exempt
+        with patch("utils.graph_api.is_litigation_hold_active", side_effect=RuntimeError("EXO 503")):
+            assert is_automated_deletion_exempt(
+                "user-001", {}, ad_user={"customSecurityAttributes": {}},
+            ) == (True, "legal_hold_check_failed")
+
+    def test_ef_alert_goes_to_manager_and_forwarding_recipient(self, monkeypatch):
+        monkeypatch.setenv("IT_EMAIL", "it@netradyne.com")
+        record = make_record()
+        record.update(managerEmail="mgr@netradyne.com", forwardingAddress="peer@netradyne.com")
+        with patch("utils.email_sender._send", return_value=True) as mock_send:
+            from utils.email_sender import send_ef_alert
+            assert send_ef_alert(record, days_remaining=7) is True
+        sent = [(c.args[0], c.kwargs.get("cc_address")) for c in mock_send.call_args_list]
+        assert sent == [("mgr@netradyne.com", "it@netradyne.com"), ("peer@netradyne.com", None)]

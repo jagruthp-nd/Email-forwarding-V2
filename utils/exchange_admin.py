@@ -104,6 +104,24 @@ def get_mailbox_forwarding(user_principal_name: str) -> Dict[str, Any]:
         return result
 
 
+def is_mailbox_on_legal_hold(identity: str) -> bool:
+    """
+    True when the mailbox has Litigation Hold or an eDiscovery hold ("UniH…" in InPlaceHolds).
+
+    Retention-policy entries (mbx/skp/cld…) are not legal holds and are ignored.
+    Raises on any lookup error so callers fail closed (unknown → never delete).
+    *identity* may be the Entra object ID, UPN or SMTP address.
+    """
+    url = f"{_EXO_BASE}/{_tenant()}/Mailbox('{identity}')?$select=LitigationHoldEnabled,InPlaceHolds"
+    resp = requests.get(url, headers=_exo_headers(), timeout=60)
+    if resp.status_code != 200:
+        raise RuntimeError(f"EXO HTTP {resp.status_code}: {(resp.text or '')[:200]}")
+    data = resp.json()
+    return bool(data.get("LitigationHoldEnabled")) or any(
+        str(h).startswith("UniH") for h in data.get("InPlaceHolds") or []
+    )
+
+
 def set_mailbox_forwarding(user_principal_name: str, forwarding_address: str) -> bool:
     """Set Admin Center SMTP forwarding (Keep a copy = DeliverToMailboxAndForward)."""
     from .automation_flags import is_ef_revoke_disabled

@@ -66,7 +66,6 @@ from .graph_api    import (
     is_auto_reply_enabled,
     set_auto_reply,
     disable_auto_reply,
-    is_litigation_hold_active,
     get_ticket_ref_attribute,
     revoke_sign_in_sessions,
 )
@@ -80,7 +79,7 @@ from .email_sender import (
     send_no_ef_pre_deletion_notice,
 )
 from .approval_webhook import generate_approval_urls
-from .automation_flags import is_dry_run, log_active_gates, resolve_ooo_contact
+from .automation_flags import is_dry_run, is_test_mode, log_active_gates, resolve_ooo_contact
 from .deletion_exempt import is_automated_deletion_exempt
 
 logger = logging.getLogger(__name__)
@@ -324,7 +323,12 @@ def _process_user(
         user_id, days_elapsed, ef_required, ext_count, status,
     )
 
+    # Retry OOO setup when it couldn't be read at registration (never set, never preserved)
+    if not (record.get("oooSetDate") or _bool(record.get("oooPreserved", False)) or record.get("oooDisabledDate")):
+        _ensure_ooo(user_id, record, store)
+
     # ── OOO duration check – disable after OOO_MAX_DAYS ────────────────────
+    # Only our own OOO has oooSetDate; a user-written OOO (oooPreserved) is never disabled.
     ooo_set_str = record.get("oooSetDate", "")
     if ooo_set_str and not record.get("oooDisabledDate"):
         try:
@@ -670,6 +674,8 @@ def _do_delete(
         user_email=record.get("userEmail", ""),
         ad_user=ad_user,
     )
+    if exempt_reason == "legal_hold":
+        return _retain_for_legal_hold(user_id, record, store, reason)
     if exempt:
         logger.info(
             "userId=%s automated deletion SKIPPED (exempt=%s) reason=%s",
@@ -700,23 +706,6 @@ def _do_delete(
                 f"DELETE_REGION='{_DELETE_REGION}'. Manual deletion required.",
             )
             return "no_action"
-
-    # ── Litigation hold check ───────────────────────────────────────────────
-    try:
-        if is_litigation_hold_active(user_id):
-            logger.warning(
-                "userId=%s has active litigation hold – deletion SKIPPED. IT must manage this manually.",
-                user_id,
-            )
-            store.append_audit(
-                user_id,
-                "DELETE_SKIPPED_LEGAL_HOLD",
-                f"reason={reason}. Active litigation/in-place hold detected via Graph beta. Manual deletion required.",
-            )
-            _update_compliance_from_record(record, store, legalHoldActive=True, legalHoldChecked=today_str)
-            return "no_action"
-    except Exception as exc:
-        logger.error("userId=%s litigation hold check failed: %s – proceeding with caution", user_id, exc)
 
     if is_dry_run():
         store.append_audit(user_id, "DRY_RUN_WOULD_DELETE", f"reason={reason}")
@@ -751,6 +740,28 @@ def _do_delete(
     mark_deleted(record, store, reason, deleted_by="automation", deleted_date=today_str)
     logger.info("Deleted userId=%s reason=%s", user_id, reason)
     return "deleted"
+
+
+def _retain_for_legal_hold(user_id: str, record: Dict[str, Any], store: TableStore, reason: str) -> str:
+    """Legal hold: reminders and the forwarding lifecycle run as normal, but the account is never deleted."""
+    today_str = datetime.now(timezone.utc).date().isoformat()
+    # The Day-90 path never passes through _do_remove_ef, so end forwarding here.
+    if _bool(record.get("efRequired", False)) and record.get("statusCode") != "EF_DISABLED":
+        disable_email_forwarding(user_id)
+        record["statusCode"]     = "EF_DISABLED"
+        record["efDisabledDate"] = today_str
+        store.append_audit(user_id, "EF_DISABLED", f"reason={reason}. Legal hold – forwarding ended, account retained.")
+    if not _bool(record.get("legalHoldActive", False)):
+        store.append_audit(
+            user_id, "DELETE_SKIPPED_LEGAL_HOLD",
+            f"reason={reason}. Litigation/eDiscovery hold – account retained; IT/Legal manage it manually.",
+        )
+        logger.warning("userId=%s on legal hold – account retained, not deleted", user_id)
+    record["legalHoldActive"]  = True
+    record["legalHoldChecked"] = today_str
+    store.upsert_user(record)
+    _update_compliance_from_record(record, store, legalHoldActive=True, legalHoldChecked=today_str)
+    return "no_action"
 
 
 def mark_deleted(
@@ -938,6 +949,7 @@ def _create_record(
         "displayName":         user.get("displayName", ""),
         "managerId":           manager_id,
         "managerEmail":        manager_email,
+        "managerName":         manager_obj.get("displayName", ""),
         "country":             user.get("country", ""),
         "usageLocation":       usage_location,
         "offboardDate":        offboard_date.isoformat(),
@@ -985,27 +997,7 @@ def _create_record(
     except Exception as exc:
         logger.error("Session revocation failed for userId=%s: %s", user_id, exc)
 
-    # Set OOO on first registration (internal-only; test mode uses prem_testing as contact)
-    try:
-        if not is_auto_reply_enabled(user_id):
-            mgr_name = manager_obj.get("displayName", "") or manager_email
-            ooo_name, ooo_email = resolve_ooo_contact(mgr_name, manager_email)
-            ooo_ok = set_auto_reply(
-                user_id,
-                manager_name=ooo_name,
-                manager_email=ooo_email,
-                forwarding_active=ef_required,
-            )
-            if ooo_ok:
-                record["oooSetDate"] = offboard_date.isoformat()
-                store.upsert_user(record)
-                logger.info("OOO set (internal-only) for userId=%s contact=%s", user_id, ooo_email)
-        else:
-            record["oooSetDate"] = offboard_date.isoformat()
-            store.upsert_user(record)
-            logger.info("OOO already active for userId=%s – skipping set", user_id)
-    except Exception as exc:
-        logger.error("OOO setup failed for userId=%s: %s", user_id, exc)
+    _ensure_ooo(user_id, record, store)
 
     # Create initial ComplianceExport record
     _update_compliance_from_record(record, store, firstSeenDate=offboard_date.isoformat())
@@ -1061,6 +1053,42 @@ def _already_alerted(last_alert_date: str, offboard_date: date, window_start_day
         return window_start <= alerted <= window_end
     except ValueError:
         return False
+
+
+def _ensure_ooo(user_id: str, record: Dict[str, Any], store: TableStore) -> None:
+    """
+    Set our internal-only OOO, unless the user already wrote their own.
+
+    A user's own message (e.g. "contact A for X, B for Y") is kept as-is and never
+    disabled. If the current state can't be read, do nothing: the next daily run
+    retries, so a read error can never overwrite the user's message.
+    """
+    try:
+        existing = is_auto_reply_enabled(user_id)
+        if existing is None:
+            logger.warning("userId=%s OOO state unreadable – will retry next run", user_id)
+            return
+        if existing:
+            record["oooPreserved"] = True
+            store.upsert_user(record)
+            store.append_audit(user_id, "OOO_PRESERVED", "User's own auto-reply was already active; left unchanged.")
+            logger.info("OOO already set by user for userId=%s – preserved", user_id)
+            return
+        ooo_name, ooo_email = resolve_ooo_contact(record.get("managerName", ""), record.get("managerEmail", ""))
+        if set_auto_reply(
+            user_id,
+            manager_name=ooo_name,
+            manager_email=ooo_email,
+            forwarding_active=_bool(record.get("efRequired", False)),
+            # test mode keeps every contact on the test mailbox
+            forwarding_address="" if is_test_mode() else record.get("forwardingAddress", ""),
+            employee_name=record.get("displayName", ""),
+        ):
+            record["oooSetDate"] = record.get("offboardDate", "") or datetime.now(timezone.utc).date().isoformat()
+            store.upsert_user(record)
+            logger.info("OOO set (internal-only) for userId=%s contact=%s", user_id, ooo_email)
+    except Exception as exc:
+        logger.error("OOO setup failed for userId=%s: %s", user_id, exc)
 
 
 def _disable_ooo(user_id: str, record: Dict[str, Any], store: TableStore) -> None:

@@ -11,8 +11,9 @@ Ways to exempt an account (any one is enough):
   4. DELETION_EXEMPT_USER_IDS  – comma-separated Entra object IDs (app setting)
   5. DELETION_EXEMPT_EMAILS    – comma-separated primary SMTP addresses
 
-Litigation hold still blocks deletion separately; exempt is for operational
-holds without legal hold.
+  6. Litigation Hold / eDiscovery hold on the mailbox (Exchange) → "legal_hold".
+     If the hold can't be read the account is treated as held (fail closed).
+     The forwarding lifecycle still runs for held accounts; only deletion stops.
 """
 
 from __future__ import annotations
@@ -73,5 +74,13 @@ def is_automated_deletion_exempt(
             "CSA DeleteExempt check failed for userId=%s: %s – continuing without CSA exempt",
             user_id, exc,
         )
+
+    try:
+        from .graph_api import is_litigation_hold_active
+        if is_litigation_hold_active(user_id):
+            return True, "legal_hold"
+    except Exception as exc:
+        logger.warning("Legal hold check failed for userId=%s: %s – treating as held", user_id, exc)
+        return True, "legal_hold_check_failed"
 
     return False, ""
