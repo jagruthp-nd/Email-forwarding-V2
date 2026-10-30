@@ -214,12 +214,20 @@ Any one of these stops an automated delete:
 | Rule | Why |
 |---|---|
 | Usage location is not India | Non-India accounts are out of scope; IT handles them. |
-| Litigation Hold or eDiscovery hold is on (read from Exchange) | Legal must manage the mailbox. Reminders and the forwarding timeline still run as normal; forwarding is turned off on schedule (Day 90 at the latest), but the account is **never deleted**. If the hold can't be read, the account is treated as held. |
+| Litigation Hold or eDiscovery hold is on (read from Exchange) | Legal must manage the mailbox. If the hold can't be read, the account is treated as held for that day and checked again the next day. |
 | Entra flag `EFAutomation.DeleteExempt` is set | Operational hold (investigation, dispute, special case). |
 | The person is on an IT exemption list | Same idea, maintained by IT. |
 | Pre-deletion notice has not been sent, or the 3-day lead has not passed | Policy 4.6.2 — no silent deletion of no-access mailboxes. |
 | The mailbox still has forwarding (cleanup only) | That account belongs on Path B, not the cleanup job. |
 | UAT / “do not delete accounts” is on | Used while the team is validating the process. |
+
+### What happens to held or exempt accounts
+
+For a legal hold, `EFAutomation.DeleteExempt`, or an IT exemption list entry:
+
+- Reminders and the forwarding timeline run as normal. Forwarding is turned off on schedule (Day 90 at the latest).
+- Their emails **only talk about email forwarding** ("Email forwarding has been disabled"). They never mention account deletion.
+- The account is **never deleted** by the automation. At the point it would have been deleted, it is marked *retained* and the automation **never picks it up again**, even if the hold or exemption is later removed. IT deletes it manually when appropriate.
 
 Those accounts stay in the reports so they are not forgotten.
 

@@ -598,8 +598,8 @@ class TestDeletionExemptAndDryRun:
             result = _process_user(ad, today, store, record)
         assert result == "no_action"
         mock_del.assert_not_called()
-        store.append_audit.assert_called()
-        assert store.append_audit.call_args[0][1] == "DELETE_SKIPPED_EXEMPT"
+        assert store.append_audit.call_args[0][1] == "DELETE_SKIPPED_RETAINED"
+        assert record["retainedReason"] == "tracking_deletion_exempt"
 
     def test_cleanup_skips_exempt_user_via_env(self, monkeypatch):
         monkeypatch.setenv("DELETION_EXEMPT_USER_IDS", "user-001")
@@ -628,7 +628,8 @@ class TestDeletionExemptAndDryRun:
             result = _process_user(ad, date.today(), store, record)
         assert result == "no_action"
         mock_del.assert_not_called()
-        assert store.append_audit.call_args[0][1] == "DELETE_SKIPPED_EXEMPT"
+        assert store.append_audit.call_args[0][1] == "DELETE_SKIPPED_RETAINED"
+        assert record["retainedReason"] == "csa_delete_exempt"
 
     def test_cleanup_skips_csa_delete_exempt_string(self):
         store = MagicMock()
@@ -980,15 +981,71 @@ class TestManagerFeedback:
         with patch("utils.graph_api.is_litigation_hold_active", return_value=True), \
              patch("utils.monitor_accounts.delete_user") as mock_del, \
              patch("utils.monitor_accounts.disable_email_forwarding", return_value=True) as mock_off, \
+             patch("utils.monitor_accounts.send_ef_removed_notice", return_value=True) as mock_off_mail, \
              patch("utils.monitor_accounts.send_final_deletion_notice") as mock_mail:
             from utils.monitor_accounts import _do_delete
             result = _do_delete("user-001", record, "MAX_POLICY_DAY90", store, is_final=True,
                                 ad_user={"customSecurityAttributes": {}})
         assert result == "no_action"
         mock_del.assert_not_called()
-        mock_mail.assert_not_called()
+        mock_mail.assert_not_called()   # no "account deleted" email
         mock_off.assert_called_once_with("user-001")
+        assert mock_off_mail.call_args.kwargs["retained"] is True
         assert record["statusCode"] == "EF_DISABLED" and record["legalHoldActive"] is True
+        assert record["retainedReason"] == "legal_hold"
+
+    def _delete_env(self, monkeypatch):
+        monkeypatch.setenv("EF_UAT_MODE", "false")
+        monkeypatch.setenv("DISABLE_ACCOUNT_DELETION", "false")
+        monkeypatch.setenv("DISABLE_GRAPH_WRITES", "false")
+        monkeypatch.delenv("EF_DRY_RUN", raising=False)
+
+    def test_delete_exempt_without_hold_is_retained_too(self, monkeypatch):
+        self._delete_env(monkeypatch)
+        monkeypatch.setenv("DELETION_EXEMPT_EMAILS", "user-001@netradyne.com")
+        record = make_record(offboard_days_ago=46, status="EF_DISABLED")
+        with patch("utils.monitor_accounts.delete_user") as mock_del:
+            from utils.monitor_accounts import _do_delete
+            result = _do_delete("user-001", record, "NO_EXTENSION_DAY30", MagicMock(),
+                                ad_user={"customSecurityAttributes": {}})
+        assert result == "no_action"
+        mock_del.assert_not_called()
+        assert record["retainedReason"] == "env_email"
+
+    def test_unreadable_hold_is_not_retained_for_good(self, monkeypatch):
+        self._delete_env(monkeypatch)
+        record = make_record(offboard_days_ago=46, status="EF_DISABLED")
+        with patch("utils.graph_api.is_litigation_hold_active", side_effect=RuntimeError("EXO 503")), \
+             patch("utils.monitor_accounts.delete_user") as mock_del:
+            from utils.monitor_accounts import _do_delete
+            _do_delete("user-001", record, "NO_EXTENSION_DAY30", MagicMock(),
+                       ad_user={"customSecurityAttributes": {}})
+        mock_del.assert_not_called()
+        assert not record.get("retainedReason")   # retried on the next run
+
+    def test_retained_is_sticky_even_after_hold_is_lifted(self):
+        from utils.deletion_exempt import is_automated_deletion_exempt
+        record = {"retainedReason": "legal_hold"}   # autouse fixture: hold now reads as lifted
+        assert is_automated_deletion_exempt("user-001", record) == (True, "legal_hold")
+
+    def test_retained_account_is_never_picked_up(self):
+        from utils.monitor_accounts import _process_user
+        record = make_record(offboard_days_ago=120)
+        record["retainedReason"] = "legal_hold"
+        assert _process_user(make_ad_user(120), date.today(), MagicMock(), record) == "skipped"
+
+    def test_retained_emails_never_mention_deletion(self):
+        record = make_record(offboard_days_ago=90, extension_count=2)
+        record["managerEmail"] = "mgr@netradyne.com"
+        with patch("utils.email_sender._send", return_value=True) as mock_send:
+            from utils.email_sender import send_ef_alert, send_ef_removed_notice
+            send_ef_alert(record, days_remaining=5, is_final=True, retained=True)
+            send_ef_alert(record, days_remaining=5, is_final=False, retained=True)
+            send_ef_removed_notice(record, days_until_delete=0, reason="MAX_POLICY_DAY90", retained=True)
+        for call in mock_send.call_args_list:
+            subject, html = call.args[1], call.args[2]
+            assert "delet" not in (subject + html).lower(), subject
+        assert mock_send.call_args_list[-1].args[1] == "Email Forwarding Disabled – Test User"
 
     def test_legal_hold_lookup_error_fails_closed(self):
         from utils.deletion_exempt import is_automated_deletion_exempt

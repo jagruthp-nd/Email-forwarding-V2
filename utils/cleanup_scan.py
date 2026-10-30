@@ -50,7 +50,7 @@ from .graph_api   import (
 from .automation_flags import is_account_deletion_disabled, is_dry_run, log_active_gates
 from .deletion_exempt import is_automated_deletion_exempt
 from .email_sender import send_deletion_notice
-from .monitor_accounts import mark_deleted, pre_deletion_notice_lead_met, send_no_ef_deletion_notice
+from .monitor_accounts import _retain_account, mark_deleted, pre_deletion_notice_lead_met, send_no_ef_deletion_notice
 
 logger = logging.getLogger(__name__)
 
@@ -91,8 +91,8 @@ def run_cleanup_scan() -> Dict[str, int]:
     for record in all_tracked.values():
         if _bool(record.get("efRequired", False)):
             continue   # has EF – daily monitor owns this
-        if record.get("statusCode") == "DELETED":
-            continue   # already done
+        if record.get("statusCode") == "DELETED" or record.get("retainedReason"):
+            continue   # already done / retained for IT to delete manually
 
         user_id = record.get("userId", "")
         if not user_id:
@@ -198,6 +198,9 @@ def _delete_stale(
         user_email=record.get("userEmail", ""),
         ad_user=ad_user,
     )
+    if exempt and exempt_reason != "legal_hold_check_failed":
+        _retain_account(user_id, record, store, "NO_EF_RETENTION", exempt_reason)
+        return "skipped_exempt"
     if exempt:
         logger.info(
             "Cleanup skip (exempt=%s) userId=%s source=%s",

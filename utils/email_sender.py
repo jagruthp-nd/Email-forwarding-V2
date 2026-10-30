@@ -100,7 +100,7 @@ def _send_to_all(recipients: List[str], subject: str, html_body: str, cc_address
 # Public email functions (one per email type)
 # ---------------------------------------------------------------------------
 
-def send_ef_alert(record: Dict[str, Any], days_remaining: int, is_final: bool = False) -> bool:
+def send_ef_alert(record: Dict[str, Any], days_remaining: int, is_final: bool = False, retained: bool = False) -> bool:
     """
     Day ALERT_DAY_1 / ALERT_DAY_2 / ALERT_DAY_3 alert to manager with CC to IT.
 
@@ -109,6 +109,7 @@ def send_ef_alert(record: Dict[str, Any], days_remaining: int, is_final: bool = 
     record         : UserTracking dict
     days_remaining : How many days until the account is deleted
     is_final       : True when this is the Day-ALERT_DAY_3 final warning (max policy)
+    retained       : account is never deleted (legal hold / exempt) – wording mentions forwarding only
     """
     recipients = _ef_recipients(record)
     if not recipients:
@@ -130,7 +131,9 @@ def send_ef_alert(record: Dict[str, Any], days_remaining: int, is_final: bool = 
             '&#9888; FINAL NOTICE – Maximum extension policy (90 days) '
             'will be reached. No further extensions are possible after this.</div>'
         )
-        subject = f"[FINAL] Email Forwarding – {employee_name} – Account Deletion in {days_remaining} days"
+        subject = f"[FINAL] Email Forwarding – {employee_name} – " + (
+            f"Forwarding Ends in {days_remaining} days" if retained else f"Account Deletion in {days_remaining} days"
+        )
     else:
         urgency_banner = (
             '<div style="background:#fd7e14;color:#fff;padding:12px 20px;'
@@ -138,6 +141,12 @@ def send_ef_alert(record: Dict[str, Any], days_remaining: int, is_final: bool = 
             f'&#9888; Action Required – Email forwarding expires in <u>{days_remaining} days</u>.</div>'
         )
         subject = f"Email Forwarding Expiration – {employee_name} – Action Required"
+
+    final_line = (
+        "Email forwarding will be disabled on the date shown above." if retained
+        else "The account will be deleted on the date shown above."
+    )
+    deadline_goal = "to keep email forwarding active" if retained else "to prevent account deletion"
 
     # Build the SDP button only when the URL is configured
     if sdp_ticket_url:
@@ -188,7 +197,7 @@ def send_ef_alert(record: Dict[str, Any], days_remaining: int, is_final: bool = 
       </tr>
     </table>
 
-    {'<p><strong>No further extensions are available. The account will be deleted on the date shown above.</strong></p>' if is_final else f'''
+    {f'<p><strong>No further extensions are available. {final_line}</strong></p>' if is_final else f'''
     <div style="background:#d1ecf1;border:1px solid #bee5eb;padding:16px;border-radius:4px;margin:20px 0;">
       <h3 style="margin:0 0 10px;color:#0c5460;">&#x2192; To request a 30-day extension:</h3>
       <ol style="margin:0;padding-left:20px;line-height:1.7;">
@@ -202,7 +211,7 @@ def send_ef_alert(record: Dict[str, Any], days_remaining: int, is_final: bool = 
       {sdp_button}
       <p style="margin:12px 0 0;font-weight:bold;color:#721c24;">
         &#9888; Your request must be raised and fully approved before
-        <u>{delete_date}</u> to prevent account deletion.
+        <u>{delete_date}</u> {deadline_goal}.
       </p>
     </div>
     <p style="font-size:13px;color:#666;">
@@ -222,13 +231,16 @@ def send_ef_alert(record: Dict[str, Any], days_remaining: int, is_final: bool = 
     return _send_to_all(recipients, subject, html, cc_address=it_email or None)
 
 
-def send_ef_removed_notice(record: Dict[str, Any], days_until_delete: int, reason: str) -> bool:
+def send_ef_removed_notice(record: Dict[str, Any], days_until_delete: int, reason: str, retained: bool = False) -> bool:
     """
     Notification sent when email forwarding is disabled at the Day-30 or
     Day-60 grace point because no extension was approved in time.
 
     The account is NOT deleted yet.  There are still *days_until_delete* days
     for IT to process a late approval (DELETE_DAY_1 / DELETE_DAY_2 thresholds).
+
+    retained=True (legal hold / delete-exempt): the account is never deleted, so
+    the email only says forwarding was disabled – no deletion date or warning.
     """
     recipients = _ef_recipients(record)
     if not recipients:
@@ -244,6 +256,7 @@ def send_ef_removed_notice(record: Dict[str, Any], days_until_delete: int, reaso
     reason_text = {
         "NO_EXTENSION_DAY30": "no approved extension request was received before the 30-day forwarding deadline",
         "NO_EXTENSION_DAY60": "no approved second extension was received before the 60-day deadline",
+        "MAX_POLICY_DAY90": "the 90-day maximum forwarding period has ended",
     }.get(reason, "the forwarding period has expired with no approved extension")
 
     if sdp_ticket_url:
@@ -259,7 +272,32 @@ def send_ef_removed_notice(record: Dict[str, Any], days_until_delete: int, reaso
             'to raise a ServiceDesk extension ticket.</p>'
         )
 
-    subject = f"[Action Required] Email Forwarding Disabled – {employee_name} – Account Deletion in {days_until_delete} days"
+    subject = (
+        f"Email Forwarding Disabled – {employee_name}" if retained
+        else f"[Action Required] Email Forwarding Disabled – {employee_name} – Account Deletion in {days_until_delete} days"
+    )
+    deletion_box = "" if retained else f'''
+    <div style="background:#fff3cd;border:1px solid #ffc107;padding:16px;border-radius:4px;margin:20px 0;">
+      <strong>&#9200; Account Deletion in {days_until_delete} day{"s" if days_until_delete != 1 else ""}
+      (on {delete_date})</strong><br>
+      The Azure AD account will be deleted on this date unless an extension is approved.
+    </div>'''
+    deletion_row = "" if retained else f'''
+      <tr style="background:#e9ecef;">
+        <td style="padding:8px 14px;font-weight:bold;border:1px solid #dee2e6;color:#dc3545;">Account Deleted On</td>
+        <td style="padding:8px 14px;border:1px solid #dee2e6;font-weight:bold;color:#dc3545;">{delete_date}</td>
+      </tr>'''
+    # No further extensions exist after Day 90
+    extension_box = "" if reason == "MAX_POLICY_DAY90" else f'''
+    <div style="background:#d1ecf1;border:1px solid #bee5eb;padding:16px;border-radius:4px;margin:20px 0;">
+      <h3 style="margin:0 0 8px;color:#0c5460;">&#x2192; To still request an extension (late approval):</h3>
+      <ol style="margin:0;padding-left:20px;line-height:1.8;">
+        <li>Raise a <strong>ServiceDesk ticket</strong> immediately with your business justification.</li>
+        <li>HR and Infosec must approve {"the request" if retained else "before the deletion date shown above"}.</li>
+        <li>IT will update the Azure AD attribute. Forwarding will be re-enabled automatically.</li>
+      </ol>
+      {sdp_button}
+    </div>'''
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -267,7 +305,7 @@ def send_ef_removed_notice(record: Dict[str, Any], days_until_delete: int, reaso
 <body style="font-family:Segoe UI,Arial,sans-serif;color:#333;max-width:640px;margin:auto;padding:20px;">
 
   <div style="background:#dc3545;color:#fff;padding:24px;border-radius:6px 6px 0 0;">
-    <h2 style="margin:0;font-size:20px;">&#9888; Email Forwarding Disabled – Account Deletion Pending</h2>
+    <h2 style="margin:0;font-size:20px;">&#9888; Email Forwarding Disabled{"" if retained else " – Account Deletion Pending"}</h2>
     <p style="margin:6px 0 0;opacity:.85;font-size:14px;">Netradyne IT Operations</p>
   </div>
 
@@ -275,12 +313,7 @@ def send_ef_removed_notice(record: Dict[str, Any], days_until_delete: int, reaso
     <p>Hello,</p>
     <p>Email forwarding for <strong>{employee_name}</strong> ({employee_mail}) has been
     <strong>disabled</strong> because {reason_text}.</p>
-
-    <div style="background:#fff3cd;border:1px solid #ffc107;padding:16px;border-radius:4px;margin:20px 0;">
-      <strong>&#9200; Account Deletion in {days_until_delete} day{"s" if days_until_delete != 1 else ""}
-      (on {delete_date})</strong><br>
-      The Azure AD account will be deleted on this date unless an extension is approved.
-    </div>
+{deletion_box}
 
     <table style="width:100%;border-collapse:collapse;margin:16px 0;font-size:13px;">
       <tr style="background:#e9ecef;">
@@ -290,22 +323,9 @@ def send_ef_removed_notice(record: Dict[str, Any], days_until_delete: int, reaso
       <tr>
         <td style="padding:8px 14px;font-weight:bold;border:1px solid #dee2e6;">Email</td>
         <td style="padding:8px 14px;border:1px solid #dee2e6;">{employee_mail}</td>
-      </tr>
-      <tr style="background:#e9ecef;">
-        <td style="padding:8px 14px;font-weight:bold;border:1px solid #dee2e6;color:#dc3545;">Account Deleted On</td>
-        <td style="padding:8px 14px;border:1px solid #dee2e6;font-weight:bold;color:#dc3545;">{delete_date}</td>
-      </tr>
+      </tr>{deletion_row}
     </table>
-
-    <div style="background:#d1ecf1;border:1px solid #bee5eb;padding:16px;border-radius:4px;margin:20px 0;">
-      <h3 style="margin:0 0 8px;color:#0c5460;">&#x2192; To still request an extension (late approval):</h3>
-      <ol style="margin:0;padding-left:20px;line-height:1.8;">
-        <li>Raise a <strong>ServiceDesk ticket</strong> immediately with your business justification.</li>
-        <li>HR and Infosec must approve before the deletion date shown above.</li>
-        <li>IT will update the Azure AD attribute. Forwarding will be re-enabled automatically.</li>
-      </ol>
-      {sdp_button}
-    </div>
+{extension_box}
 
     <p style="font-size:13px;color:#888;border-top:1px solid #dee2e6;padding-top:16px;margin-top:24px;">
       This is an automated message from IT Operations.<br>

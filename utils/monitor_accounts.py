@@ -291,6 +291,9 @@ def _process_user(
     # ── 3. Skip already-deleted ─────────────────────────────────────────────
     if record.get("statusCode") == "DELETED":
         return "skipped"
+    # Retained (legal hold / delete-exempt) accounts are IT's to delete – never picked up again
+    if record.get("retainedReason"):
+        return "skipped"
 
     # Re-detect EF / refresh forwarding target (EXO Admin Center address)
     if not is_new:
@@ -557,7 +560,8 @@ def _do_alert(
         logger.info("DRY_RUN: would send EF alert for userId=%s", user_id)
         return "dry_run"
 
-    ok = send_ef_alert(record, days_remaining=max(days_remaining, 1), is_final=is_final)
+    ok = send_ef_alert(record, days_remaining=max(days_remaining, 1), is_final=is_final,
+                       retained=_is_retained(record))
 
     # Mark the Azure AD user profile so IT can see the alert has been sent.
     # IT then changes this to one of the predefined approved values
@@ -623,12 +627,14 @@ def _do_remove_ef(
     disable_email_forwarding(user_id)
 
     # Notify manager + IT
-    send_ef_removed_notice(record, days_until_delete=days_until_delete, reason=reason)
+    retained = _is_retained(record)
+    send_ef_removed_notice(record, days_until_delete=days_until_delete, reason=reason, retained=retained)
     store.append_email_log(
         user_id=user_id,
         email_type="EF_REMOVED",
         recipient=record.get("managerEmail", ""),
-        subject=f"EF Disabled – {record.get('displayName', '')} – Account deletion in {days_until_delete}d",
+        subject=f"EF Disabled – {record.get('displayName', '')}"
+                + ("" if retained else f" – Account deletion in {days_until_delete}d"),
         status="SENT",
     )
 
@@ -674,8 +680,9 @@ def _do_delete(
         user_email=record.get("userEmail", ""),
         ad_user=ad_user,
     )
-    if exempt_reason == "legal_hold":
-        return _retain_for_legal_hold(user_id, record, store, reason)
+    # An unreadable hold is retried tomorrow; every other exemption retains the account for good.
+    if exempt and exempt_reason != "legal_hold_check_failed":
+        return _retain_account(user_id, record, store, reason, exempt_reason)
     if exempt:
         logger.info(
             "userId=%s automated deletion SKIPPED (exempt=%s) reason=%s",
@@ -742,25 +749,46 @@ def _do_delete(
     return "deleted"
 
 
-def _retain_for_legal_hold(user_id: str, record: Dict[str, Any], store: TableStore, reason: str) -> str:
-    """Legal hold: reminders and the forwarding lifecycle run as normal, but the account is never deleted."""
+def _is_retained(record: Dict[str, Any]) -> bool:
+    """True when the automation will never delete this account (legal hold or delete-exempt).
+
+    Its emails must talk about forwarding only, never deletion. An unreadable hold
+    also counts, so deletion is never promised for an account that may be held.
+    """
+    return is_automated_deletion_exempt(record["userId"], record, user_email=record.get("userEmail", ""))[0]
+
+
+def _retain_account(user_id: str, record: Dict[str, Any], store: TableStore, reason: str, exempt_reason: str) -> str:
+    """
+    Legal hold / delete-exempt: reminders and the forwarding lifecycle ran as normal,
+    but the account is never deleted. From here on the automation never picks it up
+    again (retainedReason) – IT deletes it manually, even if the hold is lifted later.
+    """
     today_str = datetime.now(timezone.utc).date().isoformat()
     # The Day-90 path never passes through _do_remove_ef, so end forwarding here.
     if _bool(record.get("efRequired", False)) and record.get("statusCode") != "EF_DISABLED":
         disable_email_forwarding(user_id)
+        sent = send_ef_removed_notice(record, days_until_delete=0, reason=reason, retained=True)
+        store.append_email_log(
+            user_id=user_id, email_type="EF_REMOVED", recipient=record.get("managerEmail", ""),
+            subject=f"Email Forwarding Disabled – {record.get('displayName', '')}",
+            status="SENT" if sent else "NOT_SENT",
+        )
         record["statusCode"]     = "EF_DISABLED"
         record["efDisabledDate"] = today_str
-        store.append_audit(user_id, "EF_DISABLED", f"reason={reason}. Legal hold – forwarding ended, account retained.")
-    if not _bool(record.get("legalHoldActive", False)):
-        store.append_audit(
-            user_id, "DELETE_SKIPPED_LEGAL_HOLD",
-            f"reason={reason}. Litigation/eDiscovery hold – account retained; IT/Legal manage it manually.",
-        )
-        logger.warning("userId=%s on legal hold – account retained, not deleted", user_id)
-    record["legalHoldActive"]  = True
-    record["legalHoldChecked"] = today_str
+        store.append_audit(user_id, "EF_DISABLED", f"reason={reason}. Account retained ({exempt_reason}) – forwarding ended.")
+    record["retainedReason"] = exempt_reason
+    if exempt_reason == "legal_hold":
+        record["legalHoldActive"]  = True
+        record["legalHoldChecked"] = today_str
     store.upsert_user(record)
-    _update_compliance_from_record(record, store, legalHoldActive=True, legalHoldChecked=today_str)
+    store.append_audit(
+        user_id, "DELETE_SKIPPED_RETAINED",
+        f"reason={reason}. exempt={exempt_reason}. Account retained; IT deletes it manually. "
+        f"Automation will not process this account again.",
+    )
+    _update_compliance_from_record(record, store, retainedReason=exempt_reason)
+    logger.warning("userId=%s retained (%s) – not deleted, no longer processed", user_id, exempt_reason)
     return "no_action"
 
 

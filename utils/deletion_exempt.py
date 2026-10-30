@@ -59,6 +59,8 @@ def is_automated_deletion_exempt(
     if email and email in get_deletion_exempt_emails():
         return True, "env_email"
 
+    if (record or {}).get("retainedReason"):
+        return True, str(record["retainedReason"])
     if _record_flag(record, "deletionExempt"):
         return True, "tracking_deletion_exempt"
     if _record_flag(record, "skipCleanupDeletion"):
