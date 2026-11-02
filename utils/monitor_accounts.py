@@ -79,7 +79,7 @@ from .email_sender import (
     send_no_ef_pre_deletion_notice,
 )
 from .approval_webhook import generate_approval_urls
-from .automation_flags import is_dry_run, is_test_mode, log_active_gates, resolve_ooo_contact
+from .automation_flags import is_dry_run, log_active_gates
 from .deletion_exempt import is_automated_deletion_exempt
 
 logger = logging.getLogger(__name__)
@@ -1102,19 +1102,19 @@ def _ensure_ooo(user_id: str, record: Dict[str, Any], store: TableStore) -> None
             store.append_audit(user_id, "OOO_PRESERVED", "User's own auto-reply was already active; left unchanged.")
             logger.info("OOO already set by user for userId=%s – preserved", user_id)
             return
-        ooo_name, ooo_email = resolve_ooo_contact(record.get("managerName", ""), record.get("managerEmail", ""))
+        # Always the real contacts, even in EF_TEST_MODE: the auto-reply is read by real
+        # colleagues writing to this mailbox, not by the test inbox.
         if set_auto_reply(
             user_id,
-            manager_name=ooo_name,
-            manager_email=ooo_email,
+            manager_name=record.get("managerName", ""),
+            manager_email=record.get("managerEmail", ""),
             forwarding_active=_bool(record.get("efRequired", False)),
-            # test mode keeps every contact on the test mailbox
-            forwarding_address="" if is_test_mode() else record.get("forwardingAddress", ""),
+            forwarding_address=record.get("forwardingAddress", ""),
             employee_name=record.get("displayName", ""),
         ):
             record["oooSetDate"] = record.get("offboardDate", "") or datetime.now(timezone.utc).date().isoformat()
             store.upsert_user(record)
-            logger.info("OOO set (internal-only) for userId=%s contact=%s", user_id, ooo_email)
+            logger.info("OOO set (internal-only) for userId=%s", user_id)
     except Exception as exc:
         logger.error("OOO setup failed for userId=%s: %s", user_id, exc)
 

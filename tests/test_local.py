@@ -1063,3 +1063,30 @@ class TestManagerFeedback:
             assert send_ef_alert(record, days_remaining=7) is True
         sent = [(c.args[0], c.kwargs.get("cc_address")) for c in mock_send.call_args_list]
         assert sent == [("mgr@netradyne.com", "it@netradyne.com"), ("peer@netradyne.com", None)]
+
+    def test_test_mode_never_puts_test_mailbox_in_ooo(self, monkeypatch):
+        """EF_TEST_MODE redirects our emails only; the auto-reply is read by real colleagues."""
+        monkeypatch.setenv("EF_TEST_MODE", "true")
+        from utils.monitor_accounts import _ensure_ooo
+        record = make_record()
+        record.update(managerName="Roshan Mathews", managerEmail="roshan.mathews@netradyne.com",
+                      forwardingAddress="roshan.mathews@netradyne.com", displayName="Rakesh Pelluri")
+        with patch("utils.monitor_accounts.is_auto_reply_enabled", return_value=False), \
+             patch("utils.graph_api._patch", return_value=True) as mock_patch:
+            _ensure_ooo("user-001", record, MagicMock())
+        msg = mock_patch.call_args[0][1]["automaticRepliesSetting"]["internalReplyMessage"]
+        assert "prem_testing" not in msg
+        assert "please reach out to Roshan Mathews (roshan.mathews@netradyne.com)" in msg
+
+    def test_internal_forwarding_target_id_is_resolved_to_email(self):
+        """EXO returns an Entra object ID (not SMTP) when forwarding goes to an internal recipient."""
+        from utils import exchange_admin
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = {"ForwardingAddress": "c0779691-b976-47c3-945e-ea9adcb24a75",
+                                  "ForwardingSmtpAddress": None, "DeliverToMailboxAndForward": True}
+        with patch.object(exchange_admin, "_exo_headers", return_value={}), \
+             patch.object(exchange_admin, "_tenant", return_value="t"), \
+             patch.object(exchange_admin.requests, "get", return_value=resp), \
+             patch("utils.graph_api._get", return_value={"mail": "neha.singh@netradyne.com"}):
+            out = exchange_admin.get_mailbox_forwarding("tabinda.qureshi@netradyne.com")
+        assert out["forwardingAddress"] == "neha.singh@netradyne.com"

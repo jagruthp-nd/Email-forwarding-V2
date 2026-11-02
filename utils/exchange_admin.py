@@ -51,6 +51,13 @@ def _normalize_smtp(addr: Optional[str]) -> str:
     return a.strip()
 
 
+def _resolve_recipient_id(object_id: str) -> str:
+    """ForwardingAddress for an internal recipient is its Entra object ID – return its email ("" if unknown)."""
+    from .graph_api import _GRAPH_BASE, _get
+    obj = _get(f"{_GRAPH_BASE}/directoryObjects/{object_id}?$select=mail") or {}
+    return obj.get("mail") or ""
+
+
 def get_mailbox_forwarding(user_principal_name: str) -> Dict[str, Any]:
     """
     Return admin-center mailbox forwarding for a UPN.
@@ -92,6 +99,8 @@ def get_mailbox_forwarding(user_principal_name: str) -> Dict[str, Any]:
         elif not addr and isinstance(fwd_obj, dict):
             addr = _normalize_smtp(fwd_obj.get("PrimarySmtpAddress") or fwd_obj.get("Name"))
 
+        if addr and "@" not in addr:
+            addr = _resolve_recipient_id(addr)
         result["rawSmtp"] = raw or ""
         result["forwardingAddress"] = addr
         result["enabled"] = bool(addr) or deliver

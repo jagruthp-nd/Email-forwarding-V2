@@ -24,6 +24,11 @@ Environment gates for safe local, UAT, and production runs.
 
   EF_TEST_MODE=true
       Redirect every outbound email To → EF_TEST_RECIPIENT and strip CC.
+      Does NOT change the mailbox auto-reply (OOO): real colleagues read it, so it
+      always names the real manager / forwarding recipient.
+
+  Note: EF_UAT_MODE only blocks account deletion. Unless DISABLE_GRAPH_WRITES=true,
+  OOO, session revocation and forwarding removal still write to real mailboxes.
 """
 
 from __future__ import annotations
@@ -106,13 +111,6 @@ def apply_test_email_routing(
         test_to,
     )
     return test_to, None
-
-
-def resolve_ooo_contact(manager_name: str, manager_email: str) -> tuple:
-    if is_test_mode():
-        test_to = get_test_recipient()
-        return "IT Testing (prem_testing)", test_to
-    return manager_name or manager_email, manager_email
 
 
 def log_active_gates(context: str) -> None:
