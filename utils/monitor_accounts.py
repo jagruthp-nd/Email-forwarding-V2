@@ -78,7 +78,7 @@ from .email_sender import (
     send_it_approval_notification,
     send_no_ef_pre_deletion_notice,
 )
-from .approval_webhook import generate_approval_urls
+from .approval_webhook import _EXT_TYPE_MAP, generate_approval_urls
 from .automation_flags import is_dry_run, log_active_gates
 from .deletion_exempt import is_automated_deletion_exempt
 
@@ -186,20 +186,9 @@ def run_monitor() -> Dict[str, int]:
 
         try:
             summary["checked"] += 1
-            # report_ctx unused daily – weekly/monthly reports read AuditLog REGISTERED
-            action = _process_user(user, today, store, tracked.get(user_id), None)
-            if action == "alerted":
-                summary["alerted"] += 1
-            elif action == "notified":
-                summary["notified"] += 1
-            elif action == "ef_removed":
-                summary["ef_removed"] += 1
-            elif action == "deleted":
-                summary["deleted"] += 1
-            elif action == "skipped":
-                summary["skipped"] += 1
-            elif action == "dry_run":
-                summary["dry_run"] += 1
+            action = _process_user(user, today, store, tracked.get(user_id))
+            if action in summary:   # alerted / notified / ef_removed / deleted / skipped / dry_run / errors
+                summary[action] += 1
         except Exception as exc:
             summary["errors"] += 1
             logger.error("Unhandled error for userId=%s: %s", user_id, exc, exc_info=True)
@@ -242,7 +231,6 @@ def _process_user(
     today: date,
     store: TableStore,
     existing_record: Optional[Dict[str, Any]],
-    report_ctx: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Evaluate and act on one terminated user.
@@ -284,7 +272,7 @@ def _process_user(
 
     # ── 2. Get or create tracking record ───────────────────────────────────
     is_new = existing_record is None
-    record = existing_record or _create_record(user, offboard_date, store, report_ctx)
+    record = existing_record or _create_record(user, offboard_date, store)
     if record is None:
         return "skipped"
 
@@ -586,13 +574,12 @@ def _do_alert(
     logger.info("Alert sent for userId=%s (days_remaining=%d final=%s)", user_id, days_remaining, is_final)
 
     # Generate Approve/Decline URLs and send IT notification
-    if _IT_APPROVAL_EMAIL:
+    # No Approve/Decline once both extensions are used – approving would do nothing
+    ext_count = int(record.get("extensionCount", 0))
+    if _IT_APPROVAL_EMAIL and ext_count < _MAX_EXTENSIONS:
         try:
-            ext_count = int(record.get("extensionCount", 0))
             _token, approve_url, decline_url = generate_approval_urls(user_id, ext_count)
-            ext_type_map = {0: "EXTEND_TO_30", 1: "EXTEND_TO_60", 2: "EXTENDED_MAX"}
-            ext_type = ext_type_map.get(ext_count, "EXTEND_TO_30")
-            send_it_approval_notification(record, approve_url, decline_url, ext_type)
+            send_it_approval_notification(record, approve_url, decline_url, _EXT_TYPE_MAP[ext_count])
         except Exception as exc:
             logger.error("Failed to generate/send IT approval notification for userId=%s: %s", user_id, exc)
 
@@ -623,19 +610,21 @@ def _do_remove_ef(
         logger.info("DRY_RUN: would disable EF for userId=%s", user_id)
         return "dry_run"
 
-    # Disable forwarding via Graph API
-    disable_email_forwarding(user_id)
+    if not disable_email_forwarding(user_id):
+        store.append_audit(user_id, "EF_DISABLE_FAILED", f"reason={reason}. Forwarding not confirmed off – retrying next run.")
+        logger.error("EF disable failed for userId=%s – status unchanged, retry next run", user_id)
+        return "errors"
 
     # Notify manager + IT
     retained = _is_retained(record)
-    send_ef_removed_notice(record, days_until_delete=days_until_delete, reason=reason, retained=retained)
+    sent = send_ef_removed_notice(record, days_until_delete=days_until_delete, reason=reason, retained=retained)
     store.append_email_log(
         user_id=user_id,
         email_type="EF_REMOVED",
         recipient=record.get("managerEmail", ""),
         subject=f"EF Disabled – {record.get('displayName', '')}"
                 + ("" if retained else f" – Account deletion in {days_until_delete}d"),
-        status="SENT",
+        status="SENT" if sent else "NOT_SENT",
     )
 
     record["statusCode"]    = "EF_DISABLED"
@@ -767,7 +756,11 @@ def _retain_account(user_id: str, record: Dict[str, Any], store: TableStore, rea
     today_str = datetime.now(timezone.utc).date().isoformat()
     # The Day-90 path never passes through _do_remove_ef, so end forwarding here.
     if _bool(record.get("efRequired", False)) and record.get("statusCode") != "EF_DISABLED":
-        disable_email_forwarding(user_id)
+        if not disable_email_forwarding(user_id):
+            # Not retained yet, so tomorrow's run comes back here and retries
+            store.append_audit(user_id, "EF_DISABLE_FAILED", f"reason={reason}. Forwarding not confirmed off – retrying next run.")
+            logger.error("EF disable failed for retained userId=%s – retry next run", user_id)
+            return "errors"
         sent = send_ef_removed_notice(record, days_until_delete=0, reason=reason, retained=True)
         store.append_email_log(
             user_id=user_id, email_type="EF_REMOVED", recipient=record.get("managerEmail", ""),
@@ -940,7 +933,6 @@ def _create_record(
     user: Dict[str, Any],
     offboard_date: date,
     store: TableStore,
-    report_ctx: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Build and persist a new UserTracking record for a user seen for the first time.
@@ -1029,21 +1021,6 @@ def _create_record(
 
     # Create initial ComplianceExport record
     _update_compliance_from_record(record, store, firstSeenDate=offboard_date.isoformat())
-
-    if report_ctx is not None:
-        row = {
-            "displayName": record.get("displayName", ""),
-            "userEmail": record.get("userEmail", ""),
-            "offboardDate": record.get("offboardDate", ""),
-            "usageLocation": record.get("usageLocation", ""),
-            "managerEmail": record.get("managerEmail", ""),
-            "forwardingAddress": record.get("forwardingAddress", ""),
-            "userId": user_id,
-        }
-        if ef_required:
-            report_ctx.setdefault("new_with_ef", []).append(row)
-        else:
-            report_ctx.setdefault("new_no_ef", []).append(row)
 
     return record
 

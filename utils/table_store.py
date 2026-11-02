@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from azure.core.exceptions import ResourceNotFoundError
 from azure.data.tables import TableServiceClient, UpdateMode
@@ -172,22 +172,6 @@ class TableStore:
             self._audit.create_entity(entity)
         except Exception as exc:
             logger.error("Failed to write audit log [%s / %s]: %s", user_id, action, exc)
-
-    def get_audit_history(self, user_id: str) -> List[Dict[str, Any]]:
-        """Return all audit rows for a user, oldest-first."""
-        try:
-            return sorted(
-                [
-                    dict(e)
-                    for e in self._audit.query_entities(
-                        query_filter=f"PartitionKey eq '{user_id}'"
-                    )
-                ],
-                key=lambda r: r.get("RowKey", ""),
-            )
-        except Exception as exc:
-            logger.error("Error fetching audit for %s: %s", user_id, exc)
-            return []
 
     def list_recent_audits(self, since_iso: str) -> List[Dict[str, Any]]:
         """Return all AuditLog rows where executedAt >= since_iso (cross-partition scan).

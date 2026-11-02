@@ -238,7 +238,8 @@ def ef_approval(req: func.HttpRequest) -> func.HttpResponse:
                 return func.HttpResponse(
                     "<h2>Missing token.</h2>", status_code=400, mimetype="text/html"
                 )
-            html, status = handle_post(token, ticket_ref)
+            action     = req.form.get("action", "") or "approve"
+            html, status = handle_post(token, ticket_ref, action)
             return func.HttpResponse(html, status_code=status, mimetype="text/html")
 
         return func.HttpResponse("<h2>Method not allowed.</h2>", status_code=405, mimetype="text/html")

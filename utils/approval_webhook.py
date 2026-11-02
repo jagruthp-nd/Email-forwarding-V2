@@ -6,7 +6,7 @@ Business logic for the EF Extension Approve / Decline HTTP trigger.
 When an EF alert fires the daily monitor generates a time-limited one-use
 token and emails the IT approval mailbox with two links:
   - Approve → opens a form to enter the SD+ ticket number, then sets CSA
-  - Decline → logs the refusal; normal deletion proceeds at deadline
+  - Decline → asks to confirm, then logs the refusal; normal schedule continues
 
 Token validity: APPROVAL_TOKEN_DAYS env var (default 7 days).
 Token stored in ApprovalTokens table in Azure Table Storage.
@@ -14,6 +14,7 @@ Token stored in ApprovalTokens table in Azure Table Storage.
 
 from __future__ import annotations
 
+import html
 import logging
 import os
 import uuid
@@ -26,7 +27,6 @@ logger = logging.getLogger(__name__)
 _EXT_TYPE_MAP = {
     0: "EXTEND_TO_30",
     1: "EXTEND_TO_60",
-    2: "EXTENDED_MAX",
 }
 
 
@@ -61,87 +61,77 @@ def generate_approval_urls(user_id: str, ext_count: int) -> Tuple[str, str, str]
     return token, approve_url, decline_url
 
 
+def _valid_token(store: Any, token: str) -> Tuple[Optional[Dict[str, Any]], Optional[Tuple[str, int]]]:
+    """Return (token_record, None) when usable, else (None, (error_html, status))."""
+    rec = store.get_approval_token(token)
+    if not rec:
+        return None, (_error_page("This approval link is invalid or has expired."), 400)
+    try:
+        expires = datetime.fromisoformat(rec["expiresAt"].replace("Z", "+00:00"))
+    except (ValueError, KeyError):
+        return None, (_error_page("Invalid token data."), 400)
+    if datetime.now(timezone.utc) > expires:
+        return None, (_error_page("This approval link has expired (7-day limit). Check the latest alert email."), 410)
+    if _coerce_bool(rec.get("used", False)):
+        return None, (_error_page("This approval link has already been used."), 409)
+    return rec, None
+
+
 def handle_get(token: str, action: str) -> Tuple[str, int]:
     """
-    Handle GET request (user clicks email button).
-    Returns (html_body, http_status_code).
+    Handle GET (user clicks an email button). Only shows a form – nothing is
+    recorded on GET, so link scanners or a mis-click can't use up the token.
     """
     from .table_store import TableStore
     store = TableStore()
-    rec = store.get_approval_token(token)
+    rec, err = _valid_token(store, token)
+    if err:
+        return err
 
-    if not rec:
-        return _error_page("This approval link is invalid or has expired."), 400
-
-    try:
-        expires = datetime.fromisoformat(rec["expiresAt"].replace("Z", "+00:00"))
-        if datetime.now(timezone.utc) > expires:
-            return _error_page("This approval link has expired (7-day limit). Check the latest alert email."), 410
-    except (ValueError, KeyError):
-        return _error_page("Invalid token data."), 400
-
-    if _coerce_bool(rec.get("used", False)):
-        return _error_page("This approval link has already been used."), 409
-
-    user_id  = rec.get("userId", "")
+    user_rec = store.get_user(rec.get("userId", "")) or {}
+    name     = user_rec.get("displayName", rec.get("userId", ""))
     ext_type = rec.get("extType", "")
-    user_rec = store.get_user(user_id) or {}
-
-    display_name  = user_rec.get("displayName", user_id)
-    user_email    = user_rec.get("userEmail", "")
-    offboard_date = user_rec.get("offboardDate", "")
-
     ext_label = {
         "EXTEND_TO_30": "1st extension (+30 days, total 30 from offboard)",
         "EXTEND_TO_60": "2nd extension (+30 days, total 60 from offboard)",
-        "EXTENDED_MAX": "Final extension (+30 days, total 90 – max policy)",
     }.get(ext_type, ext_type)
 
     if action == "decline":
-        store.mark_token_used(token)
-        store.append_audit(
-            user_id, "EXTENSION_DECLINED",
-            f"IT declined extension via email button. ext_type={ext_type}. "
-            "Normal deletion will proceed at scheduled deadline.",
-        )
-        _update_compliance(store, user_id, extensionDeclinedDate=datetime.now(timezone.utc).date().isoformat())
-        logger.info("Extension DECLINED via token for userId=%s ext_type=%s", user_id, ext_type)
-        return _decline_page(display_name), 200
-
+        return _decline_form(token, name), 200
     if action == "approve":
-        return _approval_form(token, display_name, user_email, offboard_date, ext_label), 200
-
+        return _approval_form(token, name, user_rec.get("userEmail", ""), user_rec.get("offboardDate", ""), ext_label), 200
     return _error_page("Unknown action."), 400
 
 
-def handle_post(token: str, ticket_ref: str) -> Tuple[str, int]:
+def handle_post(token: str, ticket_ref: str, action: str = "approve") -> Tuple[str, int]:
     """
-    Handle POST (form submitted with ticket number).
+    Handle POST (Approve form with ticket number, or Decline confirmation).
     Returns (html_body, http_status_code).
     """
     from .table_store import TableStore
     from .graph_api import set_extension_attribute, set_ticket_ref_attribute
 
     store = TableStore()
-    rec = store.get_approval_token(token)
-
-    if not rec:
-        return _error_page("Invalid or expired token."), 400
-
-    try:
-        expires = datetime.fromisoformat(rec["expiresAt"].replace("Z", "+00:00"))
-        if datetime.now(timezone.utc) > expires:
-            return _error_page("This approval link has expired."), 410
-    except (ValueError, KeyError):
-        return _error_page("Invalid token."), 400
-
-    if _coerce_bool(rec.get("used", False)):
-        return _error_page("This link has already been used."), 409
+    rec, err = _valid_token(store, token)
+    if err:
+        return err
 
     user_id  = rec.get("userId", "")
     ext_type = rec.get("extType", "")
-    ticket   = (ticket_ref or "").strip()
+    display_name = (store.get_user(user_id) or {}).get("displayName", user_id)
 
+    if action == "decline":
+        store.mark_token_used(token)
+        store.append_audit(
+            user_id, "EXTENSION_DECLINED",
+            f"IT declined extension via email button. ext_type={ext_type}. "
+            "Normal schedule continues.",
+        )
+        _update_compliance(store, user_id, extensionDeclinedDate=datetime.now(timezone.utc).date().isoformat())
+        logger.info("Extension DECLINED via token for userId=%s ext_type=%s", user_id, ext_type)
+        return _decline_page(display_name), 200
+
+    ticket = (ticket_ref or "").strip()
     ok_ext = set_extension_attribute(user_id, ext_type)
     if ticket:
         set_ticket_ref_attribute(user_id, ticket)
@@ -160,11 +150,8 @@ def handle_post(token: str, ticket_ref: str) -> Tuple[str, int]:
     )
     _update_compliance(store, user_id, latestTicketRef=ticket,
                        extensionApprovedViaEmailDate=datetime.now(timezone.utc).date().isoformat())
-
-    user_rec = store.get_user(user_id) or {}
-    display_name = user_rec.get("displayName", user_id)
     logger.info("Extension APPROVED via token for userId=%s ext_type=%s ticket=%s", user_id, ext_type, ticket)
-    return _success_page(display_name, ext_type, ticket), 200
+    return _success_page(display_name, ext_type, html.escape(ticket)), 200
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +169,23 @@ def _error_page(msg: str) -> str:
     )
 
 
+def _decline_form(token: str, name: str) -> str:
+    return (
+        '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">'
+        '<title>Decline Extension</title></head>'
+        '<body style="font-family:Segoe UI,Arial,sans-serif;max-width:600px;margin:40px auto;padding:20px;">'
+        '<div style="background:#f8f9fa;padding:24px;border:1px solid #dee2e6;border-radius:6px;">'
+        f'<h2>Decline extension for {name}?</h2>'
+        '<p>Forwarding follows the normal schedule. This cannot be undone from this link.</p>'
+        '<form method="post" action="">'
+        f'<input type="hidden" name="token" value="{token}">'
+        '<input type="hidden" name="action" value="decline">'
+        '<button type="submit" style="background:#dc3545;color:#fff;padding:12px 28px;border:none;'
+        'border-radius:4px;font-size:15px;cursor:pointer;width:100%;">Decline Extension</button>'
+        '</form></div></body></html>'
+    )
+
+
 def _decline_page(name: str) -> str:
     return (
         '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">'
@@ -190,7 +194,7 @@ def _decline_page(name: str) -> str:
         '<div style="background:#6c757d;color:#fff;padding:24px;border-radius:6px;">'
         f'<h2>Extension Declined</h2>'
         f'<p>The extension request for <strong>{name}</strong> has been declined.</p>'
-        '<p>The account will proceed with the normal deletion schedule.</p>'
+        '<p>Email forwarding follows the normal schedule.</p>'
         '<p style="font-size:13px;opacity:.8;margin-top:16px;">You can close this window.</p>'
         '</div></body></html>'
     )

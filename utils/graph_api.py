@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import requests
 from azure.identity import DefaultAzureCredential
@@ -44,7 +44,6 @@ from azure.core.credentials import TokenCredential
 logger = logging.getLogger(__name__)
 
 _GRAPH_BASE = "https://graph.microsoft.com/v1.0"
-_GRAPH_BETA = "https://graph.microsoft.com/beta"
 _GRAPH_SCOPE = "https://graph.microsoft.com/.default"
 
 # ---------------------------------------------------------------------------
@@ -428,25 +427,34 @@ def _user_upn(user_id: str) -> str:
     return (data.get("userPrincipalName") or data.get("mail") or "").strip()
 
 
+_RULE_FWD_KEYS = ("forwardTo", "redirectTo", "forwardAsAttachmentTo")
+
+
+def _forwarding_rules(user_id: str) -> Optional[List[Dict[str, Any]]]:
+    """Enabled inbox rules that forward or redirect mail; None if the rules couldn't be read."""
+    data = _get(f"{_GRAPH_BASE}/users/{user_id}/mailFolders/inbox/messageRules")
+    if data is None:
+        return None
+    return [
+        r for r in data.get("value", [])
+        if r.get("isEnabled", True) and any((r.get("actions") or {}).get(k) for k in _RULE_FWD_KEYS)
+    ]
+
+
 def _addresses_from_inbox_rules(user_id: str) -> list:
     """Return enabled inbox-rule forward/redirect SMTP addresses."""
     addrs = []
-    rules_data = _get(
-        f"{_GRAPH_BASE}/users/{user_id}/mailFolders/inbox/messageRules"
-    )
-    if not rules_data:
-        return addrs
-    for rule in rules_data.get("value", []):
-        if not rule.get("isEnabled", True):
-            continue
-        actions = rule.get("actions") or {}
-        for key in ("forwardTo", "redirectTo", "forwardAsAttachmentTo"):
-            for recip in actions.get(key) or []:
+    for rule in _forwarding_rules(user_id) or []:
+        for key in _RULE_FWD_KEYS:
+            for recip in rule["actions"].get(key) or []:
                 addr = (recip.get("emailAddress") or {}).get("address") or ""
                 if addr and addr not in addrs:
                     addrs.append(addr)
     return addrs
 
+
+# Graph mailboxSettings has no forwarding property – forwarding lives in EXO
+# (Admin Center) or in the user's inbox rules, so only those two are used.
 
 def has_email_forwarding(user_id: str) -> bool:
     """
@@ -454,8 +462,7 @@ def has_email_forwarding(user_id: str) -> bool:
 
     Order:
       1. Exchange Online Admin API (M365 Admin Center "Email forwarding")
-      2. Graph mailboxSettings (often unavailable in this tenant)
-      3. Inbox rules with forward/redirect actions
+      2. Inbox rules with forward/redirect actions
     """
     upn = _user_upn(user_id)
     if upn:
@@ -468,12 +475,6 @@ def has_email_forwarding(user_id: str) -> bool:
         except Exception as exc:
             logger.warning("EXO forwarding check failed for %s: %s", user_id, exc)
 
-    settings = _get(f"{_GRAPH_BASE}/users/{user_id}/mailboxSettings")
-    if settings:
-        if settings.get("forwardingSmtpAddress") or settings.get("forwardingAddress"):
-            logger.info("User %s has Graph mailboxSettings forwarding", user_id)
-            return True
-
     if _addresses_from_inbox_rules(user_id):
         logger.info("User %s has forwarding inbox rule(s)", user_id)
         return True
@@ -484,8 +485,7 @@ def get_forwarding_address(user_id: str) -> Optional[str]:
     """
     Return the best-known SMTP forwarding target for *user_id*, or None.
 
-    Prefers M365 Admin Center / EXO ForwardingSmtpAddress, then Graph
-    mailboxSettings, then the first enabled inbox-rule forward target.
+    Prefers M365 Admin Center / EXO forwarding, then the first enabled inbox-rule forward target.
     """
     upn = _user_upn(user_id)
     if upn:
@@ -497,23 +497,16 @@ def get_forwarding_address(user_id: str) -> Optional[str]:
         except Exception as exc:
             logger.warning("EXO get_forwarding_address failed for %s: %s", user_id, exc)
 
-    settings = _get(f"{_GRAPH_BASE}/users/{user_id}/mailboxSettings")
-    if settings:
-        addr = settings.get("forwardingSmtpAddress") or settings.get("forwardingAddress")
-        if addr:
-            if isinstance(addr, str) and addr.lower().startswith("smtp:"):
-                return addr[5:]
-            return addr
-
     rule_addrs = _addresses_from_inbox_rules(user_id)
     return rule_addrs[0] if rule_addrs else None
 
 
 def disable_email_forwarding(user_id: str) -> bool:
     """
-    Clear email forwarding for a user (Admin Center SMTP + best-effort Graph).
+    Stop all forwarding: clear Admin Center forwarding and switch off the user's
+    forwarding inbox rules (disabled, not deleted, so IT can undo it).
 
-    Called on Day-30/60 EF grace removal and on account recovery.
+    Returns True only when both are confirmed – callers retry on the next run otherwise.
     """
     from .automation_flags import is_ef_revoke_disabled
 
@@ -522,32 +515,30 @@ def disable_email_forwarding(user_id: str) -> bool:
         return True
 
     upn = _user_upn(user_id)
-    ok = False
-    if upn:
-        try:
-            from .exchange_admin import clear_mailbox_forwarding
-            ok = clear_mailbox_forwarding(upn) or ok
-        except Exception as exc:
-            logger.warning("EXO clear forwarding failed for %s: %s", user_id, exc)
+    try:
+        from .exchange_admin import clear_mailbox_forwarding
+        ok = bool(upn) and clear_mailbox_forwarding(upn)
+    except Exception as exc:
+        logger.warning("EXO clear forwarding failed for %s: %s", user_id, exc)
+        ok = False
 
-    # Best-effort Graph clear (often unsupported on this tenant)
-    if _patch(
-        f"{_GRAPH_BASE}/users/{user_id}/mailboxSettings",
-        {"forwardingSmtpAddress": None},
-    ):
-        ok = True
+    rules = _forwarding_rules(user_id)
+    if rules is None:
+        ok = False
+    for rule in rules or []:
+        if not _patch(f"{_GRAPH_BASE}/users/{user_id}/mailFolders/inbox/messageRules/{rule['id']}",
+                      {"isEnabled": False}):
+            ok = False
 
     if ok:
-        logger.info("Cleared mailbox forwarding for userId=%s", user_id)
+        logger.info("Cleared mailbox forwarding for userId=%s (rules disabled: %d)", user_id, len(rules or []))
     else:
-        logger.warning("Could not clear mailbox forwarding for userId=%s", user_id)
+        logger.warning("Could not fully clear forwarding for userId=%s – will retry next run", user_id)
     return ok
 
 
 def enable_email_forwarding(user_id: str, forwarding_address: str) -> bool:
-    """
-    (Re-)enable mailbox-level SMTP forwarding via EXO Set-Mailbox when possible.
-    """
+    """(Re-)enable Admin Center forwarding via EXO Set-Mailbox (late extension approval)."""
     if not forwarding_address:
         logger.warning("enable_email_forwarding called for userId=%s with empty address", user_id)
         return False
@@ -558,24 +549,14 @@ def enable_email_forwarding(user_id: str, forwarding_address: str) -> bool:
         return True
 
     upn = _user_upn(user_id)
-    smtp = forwarding_address if forwarding_address.lower().startswith("smtp:") else f"smtp:{forwarding_address}"
-    if upn:
-        try:
-            from .exchange_admin import set_mailbox_forwarding
-            if set_mailbox_forwarding(upn, forwarding_address):
-                return True
-        except Exception as exc:
-            logger.warning("EXO enable forwarding exception: %s", exc)
-
-    ok = _patch(
-        f"{_GRAPH_BASE}/users/{user_id}/mailboxSettings",
-        {"forwardingSmtpAddress": smtp},
-    )
-    if ok:
-        logger.info("Re-enabled Graph mailbox forwarding → %s for userId=%s", forwarding_address, user_id)
-    else:
-        logger.warning("Could not re-enable mailbox forwarding for userId=%s", user_id)
-    return ok
+    try:
+        from .exchange_admin import set_mailbox_forwarding
+        if upn and set_mailbox_forwarding(upn, forwarding_address):
+            return True
+    except Exception as exc:
+        logger.warning("EXO enable forwarding exception: %s", exc)
+    logger.warning("Could not re-enable mailbox forwarding for userId=%s", user_id)
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -602,7 +583,7 @@ def delete_user(user_id: str) -> bool:
     Soft-delete a user from Azure AD.
 
     The deleted user moves to Entra's built-in recycle bin for 30 days.
-    Within that window the account can be restored via restore_user().
+    Within that window it can be restored from the Entra admin center (Deleted users).
     After 30 days Entra permanently deletes it automatically.
 
     Returns True on success.
@@ -613,27 +594,6 @@ def delete_user(user_id: str) -> bool:
     else:
         logger.error("Failed to delete user %s", user_id)
     return ok
-
-
-def restore_user(user_id: str) -> Tuple[bool, str]:
-    """
-    Restore a user from the Entra recycle bin.
-    Must be called within 30 days of deletion.
-
-    On success, caller should immediately call disable_email_forwarding().
-
-    Returns (success: bool, message: str).
-    """
-    result = _post(f"{_GRAPH_BASE}/directory/deletedItems/{user_id}/restore")
-    if result:
-        logger.info("User %s restored from recycle bin", user_id)
-        # Immediately disable any forwarding
-        disable_email_forwarding(user_id)
-        return True, "Account restored. Email forwarding has been disabled."
-    return False, (
-        "Restore failed. The account may already be permanently deleted "
-        "(>30 days) or the user_id is incorrect."
-    )
 
 
 def get_deleted_user(user_id: str) -> Optional[Dict[str, Any]]:

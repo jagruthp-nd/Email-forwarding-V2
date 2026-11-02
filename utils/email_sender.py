@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from .app_config import (
@@ -251,7 +251,8 @@ def send_ef_removed_notice(record: Dict[str, Any], days_until_delete: int, reaso
     sdp_ticket_url = get_servicedesk_ticket_url()
     employee_name = record.get("displayName", "the terminated employee")
     employee_mail = record.get("userEmail", "")
-    delete_date   = record.get("deleteDate", "")
+    # record["deleteDate"] is when forwarding ends (today); the account goes days_until_delete later
+    delete_date   = (datetime.now(timezone.utc).date() + timedelta(days=days_until_delete)).isoformat()
 
     reason_text = {
         "NO_EXTENSION_DAY30": "no approved extension request was received before the 30-day forwarding deadline",

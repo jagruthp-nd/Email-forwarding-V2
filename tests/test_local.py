@@ -25,7 +25,6 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-import json
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 from unittest.mock import MagicMock, patch
@@ -1090,3 +1089,85 @@ class TestManagerFeedback:
              patch("utils.graph_api._get", return_value={"mail": "neha.singh@netradyne.com"}):
             out = exchange_admin.get_mailbox_forwarding("tabinda.qureshi@netradyne.com")
         assert out["forwardingAddress"] == "neha.singh@netradyne.com"
+
+
+# ---------------------------------------------------------------------------
+# Tests: pre-production review fixes
+# ---------------------------------------------------------------------------
+
+class TestPreProductionFixes:
+    def test_failed_forwarding_removal_is_not_recorded_and_retries(self):
+        """Forwarding not confirmed off → no 'disabled' email, status unchanged so tomorrow retries."""
+        from utils.monitor_accounts import _do_remove_ef
+        store = MagicMock()
+        record = make_record(offboard_days_ago=30)
+        with patch("utils.monitor_accounts.disable_email_forwarding", return_value=False), \
+             patch("utils.monitor_accounts.send_ef_removed_notice") as mock_mail:
+            result = _do_remove_ef("user-001", record, store, "NO_EXTENSION_DAY30", 16)
+        assert result == "errors"
+        mock_mail.assert_not_called()
+        assert record["statusCode"] == "ACTIVE"
+        assert store.append_audit.call_args[0][1] == "EF_DISABLE_FAILED"
+
+    def test_disable_forwarding_switches_off_inbox_rules_and_fails_if_unreadable(self, monkeypatch):
+        monkeypatch.setenv("EF_UAT_MODE", "false")
+        monkeypatch.setenv("DISABLE_GRAPH_WRITES", "false")
+        monkeypatch.delenv("EF_DRY_RUN", raising=False)
+        from utils import graph_api
+        rules = {"value": [
+            {"id": "r1", "isEnabled": True, "actions": {"forwardTo": [{"emailAddress": {"address": "x@y.com"}}]}},
+            {"id": "r2", "isEnabled": True, "actions": {"moveToFolder": "abc"}},
+        ]}
+        with patch.object(graph_api, "_user_upn", return_value="u@netradyne.com"), \
+             patch("utils.exchange_admin.clear_mailbox_forwarding", return_value=True), \
+             patch.object(graph_api, "_get", return_value=rules), \
+             patch.object(graph_api, "_patch", return_value=True) as mock_patch:
+            assert graph_api.disable_email_forwarding("user-001") is True
+        assert [c.args[0].rsplit("/", 1)[-1] for c in mock_patch.call_args_list] == ["r1"]
+        assert mock_patch.call_args.args[1] == {"isEnabled": False}
+        with patch.object(graph_api, "_user_upn", return_value="u@netradyne.com"), \
+             patch("utils.exchange_admin.clear_mailbox_forwarding", return_value=True), \
+             patch.object(graph_api, "_get", return_value=None):
+            assert graph_api.disable_email_forwarding("user-001") is False
+
+    def test_final_alert_sends_no_it_approval(self, monkeypatch):
+        import utils.monitor_accounts as ma
+        monkeypatch.setattr(ma, "_IT_APPROVAL_EMAIL", "it-approve@netradyne.com")
+        monkeypatch.delenv("EF_DRY_RUN", raising=False)
+        record = make_record(offboard_days_ago=83, extension_count=2)
+        with patch.object(ma, "send_ef_alert", return_value=True), \
+             patch.object(ma, "_is_retained", return_value=False), \
+             patch.object(ma, "set_extension_attribute"), \
+             patch.object(ma, "generate_approval_urls") as mock_urls, \
+             patch.object(ma, "send_it_approval_notification") as mock_it:
+            assert ma._do_alert(record, MagicMock(), days_remaining=7, is_final=True) == "alerted"
+        mock_urls.assert_not_called()
+        mock_it.assert_not_called()
+
+    def test_forwarding_disabled_email_shows_real_deletion_date(self):
+        record = make_record(offboard_days_ago=30)
+        record["managerEmail"] = "mgr@netradyne.com"
+        expected = (datetime.now(timezone.utc).date() + timedelta(days=16)).isoformat()
+        today = datetime.now(timezone.utc).date().isoformat()
+        with patch("utils.email_sender._send", return_value=True) as mock_send:
+            from utils.email_sender import send_ef_removed_notice
+            send_ef_removed_notice(record, days_until_delete=16, reason="NO_EXTENSION_DAY30")
+        html = mock_send.call_args.args[2]
+        assert expected in html and today not in html
+
+    def test_decline_link_only_shows_form_until_confirmed(self):
+        from utils import approval_webhook
+        store = MagicMock()
+        store.get_approval_token.return_value = {
+            "token": "t1", "userId": "user-001", "extType": "EXTEND_TO_30", "used": False,
+            "expiresAt": (datetime.now(timezone.utc) + timedelta(days=1)).isoformat(),
+        }
+        store.get_user.return_value = {"displayName": "Test User"}
+        with patch("utils.table_store.TableStore", return_value=store):
+            page, status = approval_webhook.handle_get("t1", "decline")
+            assert status == 200 and 'name="action" value="decline"' in page
+            store.mark_token_used.assert_not_called()   # a link scanner opening it changes nothing
+            page, status = approval_webhook.handle_post("t1", "", "decline")
+        assert status == 200 and "Extension Declined" in page
+        store.mark_token_used.assert_called_once_with("t1")
+        assert store.append_audit.call_args[0][1] == "EXTENSION_DECLINED"
