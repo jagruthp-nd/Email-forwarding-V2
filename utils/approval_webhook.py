@@ -103,7 +103,27 @@ def handle_get(token: str, action: str) -> Tuple[str, int]:
     return _error_page("Unknown action."), 400
 
 
-def handle_post(token: str, ticket_ref: str, action: str = "approve") -> Tuple[str, int]:
+def _decided_by(typed: str, principal: str) -> Tuple[str, bool]:
+    """
+    Who made the decision → (identity, verified).
+
+    *principal* is the Entra sign-in name, only passed when App Service Authentication
+    is on (verified). Otherwise the typed email is used, limited to our own domain.
+    Returns ("", False) when neither is usable.
+    """
+    if principal:
+        return principal, True
+    from .app_config import get_sender_email
+    email = (typed or "").strip().lower()
+    domain = get_sender_email().split("@")[-1].lower()
+    if len(email) > 254 or email.count("@") != 1 or not email.endswith("@" + domain):
+        return "", False
+    return email, False
+
+
+def handle_post(
+    token: str, ticket_ref: str, action: str = "approve", decided_by: str = "", principal: str = "",
+) -> Tuple[str, int]:
     """
     Handle POST (Approve form with ticket number, or Decline confirmation).
     Returns (html_body, http_status_code).
@@ -116,15 +136,22 @@ def handle_post(token: str, ticket_ref: str, action: str = "approve") -> Tuple[s
     if err:
         return err
 
+    who, verified = _decided_by(decided_by, principal)
+    if not who:
+        return _error_page("Please go back and enter your Netradyne email address."), 400
+
     user_id  = rec.get("userId", "")
     ext_type = rec.get("extType", "")
-    display_name = (store.get_user(user_id) or {}).get("displayName", user_id)
+    user_rec = store.get_user(user_id) or {}
+    display_name = user_rec.get("displayName", user_id)
+    decision = dict(decidedBy=who, decidedByVerified=verified,
+                    displayName=display_name, userEmail=user_rec.get("userEmail", ""))
 
     if action == "decline":
-        store.mark_token_used(token)
+        store.mark_token_used(token, decision="DECLINED", **decision)
         store.append_audit(
             user_id, "EXTENSION_DECLINED",
-            f"IT declined extension via email button. ext_type={ext_type}. "
+            f"IT declined extension via email button. ext_type={ext_type} by={who} verified={verified}. "
             "Normal schedule continues.",
         )
         _update_compliance(store, user_id, extensionDeclinedDate=datetime.now(timezone.utc).date().isoformat())
@@ -142,10 +169,11 @@ def handle_post(token: str, ticket_ref: str, action: str = "approve") -> Tuple[s
             "Please set the CSA manually in the Azure portal, or contact IT administration."
         ), 500
 
-    store.mark_token_used(token)
+    store.mark_token_used(token, decision="APPROVED", ticketRef=ticket, **decision)
     store.append_audit(
         user_id, "EXTENSION_APPROVED_EMAIL",
-        f"IT approved extension via email button. ext_type={ext_type} ticketRef={ticket}. "
+        f"IT approved extension via email button. ext_type={ext_type} ticketRef={ticket} "
+        f"by={who} verified={verified}. "
         "CSA ExtStatus set – daily monitor will apply extension in next run.",
     )
     _update_compliance(store, user_id, latestTicketRef=ticket,
@@ -180,6 +208,9 @@ def _decline_form(token: str, name: str) -> str:
         '<form method="post" action="">'
         f'<input type="hidden" name="token" value="{token}">'
         '<input type="hidden" name="action" value="decline">'
+        '<label for="dby" style="font-weight:bold;display:block;margin:12px 0 6px;">Your Netradyne email</label>'
+        '<input type="email" id="dby" name="decided_by" required placeholder="name@netradyne.com" '
+        'style="width:100%;padding:10px;font-size:14px;border:1px solid #ced4da;border-radius:4px;box-sizing:border-box;margin-bottom:16px;">'
         '<button type="submit" style="background:#dc3545;color:#fff;padding:12px 28px;border:none;'
         'border-radius:4px;font-size:15px;cursor:pointer;width:100%;">Decline Extension</button>'
         '</form></div></body></html>'
@@ -227,6 +258,10 @@ def _approval_form(token: str, name: str, email: str, offboard: str, ext_label: 
       SD+ Ticket Number <span style="color:#888;font-weight:normal;">(optional but recommended)</span>
     </label>
     <input type="text" id="tref" name="ticket_ref" placeholder="e.g. 12345"
+      style="width:100%;padding:10px;font-size:14px;border:1px solid #ced4da;border-radius:4px;
+      box-sizing:border-box;margin-bottom:16px;">
+    <label for="dby" style="font-weight:bold;display:block;margin-bottom:6px;">Your Netradyne email</label>
+    <input type="email" id="dby" name="decided_by" required placeholder="name@netradyne.com"
       style="width:100%;padding:10px;font-size:14px;border:1px solid #ced4da;border-radius:4px;
       box-sizing:border-box;margin-bottom:16px;">
     <button type="submit"

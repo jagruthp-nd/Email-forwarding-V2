@@ -22,12 +22,14 @@ Email types (Workflow B):
 
 from __future__ import annotations
 
+import html as html_lib
 import logging
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from .app_config import (
+    get_approval_report_emails,
     get_admin_emails,
     get_it_approval_email,
     get_it_email,
@@ -755,6 +757,7 @@ def send_offboard_consolidated_report(
     period_label: str = "Weekly",
     period_start: str = "",
     deleted: Optional[List[Dict[str, Any]]] = None,
+    approvals: Optional[List[Dict[str, Any]]] = None,
 ) -> int:
     """
     Consolidated weekly/monthly report for IT / team mailbox (REPORT_EMAILS).
@@ -937,6 +940,7 @@ def send_offboard_consolidated_report(
         overdue_no_ef=overdue_no_ef,
         summary=summary,
         deleted=deleted,
+        approvals=approvals,
     )
     uploaded: List[Dict[str, Any]] = []
     last_err = ""
@@ -1047,3 +1051,32 @@ def send_final_deletion_notice(record: Dict[str, Any]) -> bool:
     ok = _send_to_all(recipients, subject, html)
     _send_admin_soft_delete_notice(record, reason="MAX_POLICY_DAY90", max_policy=True)
     return ok
+
+
+def send_approvals_report(
+    approvals: List[Dict[str, Any]], period_label: str, period_start: str, report_date: str,
+) -> int:
+    """Extension Approve/Decline decisions for the period → APPROVAL_REPORT_EMAILS (blank = not sent)."""
+    recipients = get_approval_report_emails()
+    if not recipients:
+        return 0
+    cell = "<td style='padding:8px;border:1px solid #dee2e6;'>{}</td>"
+    cols = ("displayName", "userEmail", "decision", "extType", "ticketRef", "decidedBy", "decidedByVerified", "decidedAt")
+    rows = "".join(
+        "<tr>" + "".join(cell.format(html_lib.escape(str(r.get(k, "") or "—"))) for k in cols) + "</tr>"
+        for r in approvals
+    ) or '<tr><td colspan="8" style="padding:10px;color:#666;">No decisions this period.</td></tr>'
+    head = "".join(
+        f"<th style='padding:8px;border:1px solid #dee2e6;text-align:left;'>{h}</th>"
+        for h in ("Employee", "Email", "Decision", "Extension", "Ticket", "Decided by", "Verified sign-in", "When (UTC)")
+    )
+    subject = f"[EF Automation] {period_label} extension decisions – {report_date} ({len(approvals)})"
+    html = f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"></head>
+<body style="font-family:Segoe UI,Arial,sans-serif;color:#333;max-width:920px;margin:auto;padding:20px;">
+  <h2 style="font-size:18px;">{period_label} extension Approve / Decline decisions</h2>
+  <p style="font-size:13px;color:#666;">{period_start} → {report_date}. "Verified sign-in" is Yes only when the
+  approver signed in with Entra; otherwise the email was typed on the approval form.</p>
+  <table style="width:100%;border-collapse:collapse;font-size:12px;"><tr style="background:#e9ecef;">{head}</tr>{rows}</table>
+  <p style="font-size:12px;color:#888;margin-top:16px;">Also archived to SharePoint (Approvals sheet).</p>
+</body></html>"""
+    return sum(1 for addr in recipients if _send(addr, subject, html))

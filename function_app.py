@@ -16,6 +16,7 @@ Triggers:
 
 import json
 import logging
+import os
 
 import azure.functions as func
 
@@ -239,7 +240,13 @@ def ef_approval(req: func.HttpRequest) -> func.HttpResponse:
                     "<h2>Missing token.</h2>", status_code=400, mimetype="text/html"
                 )
             action     = req.form.get("action", "") or "approve"
-            html, status = handle_post(token, ticket_ref, action)
+            # Signed-in name is only trustworthy when App Service Authentication (Easy Auth)
+            # is on – the platform then strips any client-sent copy of this header.
+            principal  = (
+                req.headers.get("X-MS-CLIENT-PRINCIPAL-NAME", "")
+                if os.environ.get("WEBSITE_AUTH_ENABLED", "").lower() == "true" else ""
+            )
+            html, status = handle_post(token, ticket_ref, action, req.form.get("decided_by", ""), principal)
             return func.HttpResponse(html, status_code=status, mimetype="text/html")
 
         return func.HttpResponse("<h2>Method not allowed.</h2>", status_code=405, mimetype="text/html")

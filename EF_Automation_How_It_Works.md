@@ -184,6 +184,10 @@ and emails the manager a confirmation
 
 IT can apply the Entra flag in the portal, **or** use the Approve link in the IT approval email (ticket number is captured on that form). Decline logs the refusal; the published deletion date still applies.
 
+Both the Approve and Decline links open a form first; nothing is recorded until it is submitted. The form asks for the approver's **Netradyne email** (company addresses only). Each decision is stored with who made it, when, the ticket number and whether the identity came from an Entra sign-in ("verified") or was typed on the form. If App Service Authentication (Entra sign-in) is later enabled on the Function App, the signed-in name is used automatically and marked verified.
+
+Decisions appear in an **Approvals** sheet in the weekly/monthly Excel/CSV archived to SharePoint. They can also be emailed to distribution lists by setting `APPROVAL_REPORT_EMAILS` (blank = not emailed).
+
 Each extension can be granted **once**. A third attempt is ignored. Maximum from offboard date is **90 days**.
 
 ---
@@ -261,7 +265,7 @@ Operations receive a consolidated report covering:
 - **Accounts deleted in the period** — name, mailbox, offboard date, deleted on, deleted by (automation / cleanup / manual), reason, and the **recoverable until** date (deleted on + 30 days)
 - Counts of alerts, extensions, and deletions in the period
 
-The same report is also archived to the IT SharePoint reports folder (Excel / CSV, including a **Deleted** sheet) so there is a lasting copy.
+The same report is also archived to the IT SharePoint reports folder (Excel / CSV, including **Deleted** and **Approvals** sheets) so there is a lasting copy.
 
 ---
 

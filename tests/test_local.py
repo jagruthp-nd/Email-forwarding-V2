@@ -1167,7 +1167,66 @@ class TestPreProductionFixes:
             page, status = approval_webhook.handle_get("t1", "decline")
             assert status == 200 and 'name="action" value="decline"' in page
             store.mark_token_used.assert_not_called()   # a link scanner opening it changes nothing
-            page, status = approval_webhook.handle_post("t1", "", "decline")
+            page, status = approval_webhook.handle_post("t1", "", "decline", "it.admin@netradyne.com")
         assert status == 200 and "Extension Declined" in page
-        store.mark_token_used.assert_called_once_with("t1")
+        assert store.mark_token_used.call_args.args == ("t1",)
+        assert store.mark_token_used.call_args.kwargs["decision"] == "DECLINED"
+        assert store.mark_token_used.call_args.kwargs["decidedBy"] == "it.admin@netradyne.com"
         assert store.append_audit.call_args[0][1] == "EXTENSION_DECLINED"
+
+
+class TestApprovalDecisionReport:
+    def _store(self):
+        store = MagicMock()
+        store.get_approval_token.return_value = {
+            "token": "t1", "userId": "user-001", "extType": "EXTEND_TO_30", "used": False,
+            "expiresAt": (datetime.now(timezone.utc) + timedelta(days=1)).isoformat(),
+        }
+        store.get_user.return_value = {"displayName": "Test User", "userEmail": "test.user@netradyne.com"}
+        return store
+
+    def test_approve_requires_company_email_and_records_it(self, monkeypatch):
+        monkeypatch.delenv("SENDER_EMAIL", raising=False)   # default sender → netradyne.com
+        from utils import approval_webhook
+        store = self._store()
+        with patch("utils.table_store.TableStore", return_value=store), \
+             patch("utils.graph_api.set_extension_attribute", return_value=True), \
+             patch("utils.graph_api.set_ticket_ref_attribute", return_value=True):
+            assert approval_webhook.handle_post("t1", "SD-1", "approve", "")[1] == 400
+            assert approval_webhook.handle_post("t1", "SD-1", "approve", "x@gmail.com")[1] == 400
+            store.mark_token_used.assert_not_called()
+            page, status = approval_webhook.handle_post("t1", "SD-1", "approve", " IT.Admin@Netradyne.com ")
+        assert status == 200
+        kw = store.mark_token_used.call_args.kwargs
+        assert (kw["decision"], kw["decidedBy"], kw["decidedByVerified"], kw["ticketRef"]) == \
+            ("APPROVED", "it.admin@netradyne.com", False, "SD-1")
+
+    def test_signed_in_identity_wins_and_is_verified(self):
+        from utils.approval_webhook import _decided_by
+        assert _decided_by("typed@netradyne.com", "real.person@netradyne.com") == ("real.person@netradyne.com", True)
+
+    def test_period_report_includes_approvals_in_sharepoint_files(self):
+        store = MagicMock()
+        store.list_all_users.return_value = []
+        store.list_recent_audits.return_value = []
+        store.list_token_decisions.return_value = [{
+            "displayName": "Test User", "userEmail": "t@netradyne.com", "decision": "APPROVED",
+            "extType": "EXTEND_TO_30", "ticketRef": "SD-1", "decidedBy": "it.admin@netradyne.com",
+            "decidedByVerified": False, "usedAt": "2026-11-02T10:00:00+00:00",
+        }]
+        from utils.weekly_report import _collect_period_data
+        from utils.report_export import build_report_csv
+        data = _collect_period_data(store, lookback_days=7)
+        assert data["approvals"][0]["decidedBy"] == "it.admin@netradyne.com"
+        csv_bytes = build_report_csv(
+            report_date="2026-11-02", period_label="Weekly", period_start="2026-10-26",
+            new_no_ef=[], new_with_ef=[], overdue_no_ef=[], summary={}, approvals=data["approvals"],
+        )
+        assert b"Approval,2026-11-02" in csv_bytes and b"it.admin@netradyne.com" in csv_bytes
+
+    def test_approvals_email_not_sent_while_dl_setting_is_blank(self, monkeypatch):
+        monkeypatch.setenv("APPROVAL_REPORT_EMAILS", "")
+        with patch("utils.email_sender._send") as mock_send:
+            from utils.email_sender import send_approvals_report
+            assert send_approvals_report([], "Weekly", "2026-10-26", "2026-11-02") == 0
+        mock_send.assert_not_called()

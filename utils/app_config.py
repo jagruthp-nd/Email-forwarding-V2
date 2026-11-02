@@ -49,6 +49,11 @@ def get_report_emails() -> List[str]:
     return report or get_admin_emails()
 
 
+def get_approval_report_emails() -> List[str]:
+    """Approve/Decline decisions report. Empty (default) = not emailed; still archived to SharePoint."""
+    return _csv_emails(os.environ.get("APPROVAL_REPORT_EMAILS", ""))
+
+
 def get_servicedesk_ticket_url() -> str:
     """URL for the 'Raise extension request' button in manager alert emails."""
     return (

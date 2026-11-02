@@ -15,6 +15,7 @@
     "IT_APPROVAL_EMAIL":     "<it-ops-approval-mailbox@netradyne.com>",
     "ADMIN_EMAILS":          "<comma-separated admin emails>",
     "REPORT_EMAILS":         "<team mailbox for weekly/monthly reports>",
+    "APPROVAL_REPORT_EMAILS": "",
     "EF_TEST_RECIPIENT":     "prem_testing@netradyne.com",
 
     "RECOVERY_GRACE_DAYS":   "30",

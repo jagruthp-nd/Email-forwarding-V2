@@ -173,6 +173,19 @@ class TableStore:
         except Exception as exc:
             logger.error("Failed to write audit log [%s / %s]: %s", user_id, action, exc)
 
+    def list_token_decisions(self, since_iso: str) -> List[Dict[str, Any]]:
+        """Approve/Decline decisions made on or after since_iso (for the approvals report)."""
+        try:
+            return [
+                dict(e)
+                for e in self._tokens.query_entities(
+                    query_filter=f"PartitionKey eq 'TOKEN' and usedAt ge '{since_iso}'"
+                )
+            ]
+        except Exception as exc:
+            logger.error("Error listing approval decisions since %s: %s", since_iso, exc)
+            return []
+
     def list_recent_audits(self, since_iso: str) -> List[Dict[str, Any]]:
         """Return all AuditLog rows where executedAt >= since_iso (cross-partition scan).
 
@@ -269,10 +282,11 @@ class TableStore:
             logger.error("Error fetching approval token: %s", exc)
             return None
 
-    def mark_token_used(self, token: str) -> None:
-        """Mark an approval token as consumed so it cannot be reused."""
+    def mark_token_used(self, token: str, **decision: Any) -> None:
+        """Mark an approval token as consumed and store who decided what (decision, decidedBy, …)."""
         record = self.get_approval_token(token)
         if record:
+            record.update(decision)
             record["used"] = True
             record["usedAt"] = datetime.now(timezone.utc).isoformat()
             try:

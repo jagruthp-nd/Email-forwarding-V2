@@ -41,6 +41,7 @@ def build_report_csv(
     overdue_no_ef: List[Dict[str, Any]],
     summary: Dict[str, Any],
     deleted: Optional[List[Dict[str, Any]]] = None,
+    approvals: Optional[List[Dict[str, Any]]] = None,
 ) -> bytes:
     """Single CSV with Section column for long-term data handling."""
     buf = io.StringIO()
@@ -63,6 +64,12 @@ def build_report_csv(
         "DeletedBy",
         "DeleteReason",
         "RecoverableUntil",
+        "Decision",
+        "ExtensionType",
+        "TicketRef",
+        "DecidedBy",
+        "DecidedByVerified",
+        "DecidedAt",
     ])
 
     for key, label in (
@@ -95,6 +102,11 @@ def build_report_csv(
         "Summary", report_date, period_label, period_start,
         "", "", "", "", "", "", "",
         "Deleted_Count", len(deleted or []),
+    ])
+    writer.writerow([
+        "Summary", report_date, period_label, period_start,
+        "", "", "", "", "", "", "",
+        "ApprovalDecisions_Count", len(approvals or []),
     ])
 
     for r in new_no_ef:
@@ -133,6 +145,15 @@ def build_report_csv(
             _cell(r.get("deleteReason")), _cell(r.get("recoverableUntil")),
         ])
 
+    for r in approvals or []:
+        writer.writerow([
+            "Approval", report_date, period_label, period_start,
+            _cell(r.get("displayName")), _cell(r.get("userEmail")),
+            "", "", "", "", "", "", "", "", "", "", "",
+            _cell(r.get("decision")), _cell(r.get("extType")), _cell(r.get("ticketRef")),
+            _cell(r.get("decidedBy")), _cell(r.get("decidedByVerified")), _cell(r.get("decidedAt")),
+        ])
+
     # UTF-8 BOM so Excel opens CSV cleanly
     return ("\ufeff" + buf.getvalue()).encode("utf-8")
 
@@ -147,6 +168,7 @@ def build_report_xlsx(
     overdue_no_ef: List[Dict[str, Any]],
     summary: Dict[str, Any],
     deleted: Optional[List[Dict[str, Any]]] = None,
+    approvals: Optional[List[Dict[str, Any]]] = None,
 ) -> bytes:
     """Multi-sheet Excel workbook."""
     from openpyxl import Workbook
@@ -215,6 +237,17 @@ def build_report_xlsx(
             r.get("usageLocation", ""),
         ])
 
+    ws_ap = wb.create_sheet("Approvals")
+    ws_ap.append([
+        "DisplayName", "UserEmail", "Decision", "ExtensionType", "TicketRef",
+        "DecidedBy", "DecidedByVerified", "DecidedAt",
+    ])
+    for r in approvals or []:
+        ws_ap.append([r.get(k, "") for k in (
+            "displayName", "userEmail", "decision", "extType", "ticketRef",
+            "decidedBy", "decidedByVerified", "decidedAt",
+        )])
+
     out = io.BytesIO()
     wb.save(out)
     return out.getvalue()
@@ -230,6 +263,7 @@ def build_report_archives(
     overdue_no_ef: List[Dict[str, Any]],
     summary: Dict[str, Any],
     deleted: Optional[List[Dict[str, Any]]] = None,
+    approvals: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Tuple[str, bytes, str]]:
     """
     Returns list of (filename, content_bytes, content_type).
@@ -245,6 +279,7 @@ def build_report_archives(
         overdue_no_ef=overdue_no_ef,
         summary=summary,
         deleted=deleted or [],
+        approvals=approvals or [],
     )
     files: List[Tuple[str, bytes, str]] = []
     for fmt in get_archive_formats():

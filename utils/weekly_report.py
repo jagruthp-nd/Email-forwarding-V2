@@ -21,7 +21,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List
 
 from .app_config import get_report_emails
-from .email_sender import send_offboard_consolidated_report
+from .email_sender import send_approvals_report, send_offboard_consolidated_report
 from .table_store import TableStore
 
 logger = logging.getLogger(__name__)
@@ -69,6 +69,19 @@ def _deleted_row(u: Dict[str, Any]) -> Dict[str, Any]:
         "recoverableUntil": recoverable,
     })
     return row
+
+
+def _approval_row(t: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "displayName": t.get("displayName", ""),
+        "userEmail": t.get("userEmail", ""),
+        "decision": t.get("decision", ""),
+        "extType": t.get("extType", ""),
+        "ticketRef": t.get("ticketRef", ""),
+        "decidedBy": t.get("decidedBy", ""),
+        "decidedByVerified": t.get("decidedByVerified", ""),
+        "decidedAt": t.get("usedAt", ""),
+    }
 
 
 def _collect_period_data(store: TableStore, lookback_days: int) -> Dict[str, Any]:
@@ -135,6 +148,10 @@ def _collect_period_data(store: TableStore, lookback_days: int) -> Dict[str, Any
         "new_with_ef": new_with_ef,
         "overdue_no_ef": overdue,
         "deleted": deleted,
+        "approvals": sorted(
+            (_approval_row(t) for t in store.list_token_decisions(since_iso)),
+            key=lambda r: r["decidedAt"],
+        ),
         "summary": {
             "alerts": alerts,
             "extensions": extensions,
@@ -187,6 +204,7 @@ def archive_period_report(
         new_with_ef=data["new_with_ef"],
         overdue_no_ef=data["overdue_no_ef"],
         deleted=data["deleted"],
+        approvals=data["approvals"],
         summary=data["summary"],
     )
     uploaded = []
@@ -232,10 +250,13 @@ def _send_period_report(period_label: str, lookback_days: int) -> Dict[str, Any]
         new_with_ef=data["new_with_ef"],
         overdue_no_ef=data["overdue_no_ef"],
         deleted=data["deleted"],
+        approvals=data["approvals"],
         summary=data["summary"],
         period_label=period_label,
         period_start=data["period_start"],
     )
+    # Approvals go to their own DLs; blank APPROVAL_REPORT_EMAILS = SharePoint archive only
+    send_approvals_report(data["approvals"], period_label, data["period_start"], data["report_date"])
     if sent:
         store.append_email_log(
             user_id=f"{period_label.upper()}_REPORT",
